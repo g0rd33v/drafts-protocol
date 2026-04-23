@@ -1,0 +1,9 @@
+{
+  "name": "drafts-receiver",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.0",
+    "simple-git": "^3.25.0"
+  }
+}
