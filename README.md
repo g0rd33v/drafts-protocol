@@ -1,119 +1,128 @@
-# Drafts
+# drafts
 
-> **The publishing layer for AI-generated artifacts.** Turn any conversation with an AI agent into a live, persistent, public URL — with no signup, no code, no friction.
+> **The publishing protocol for AI-generated artifacts.**
+> One URL. Any agent. Public the moment it exists.
 
-Drafts is a protocol + reference server for letting AI agents (and humans) publish websites, pages, PWAs, and AI-powered apps to public URLs using nothing but a passable link as their identity.
+[![Protocol](https://img.shields.io/badge/protocol-drafts%2F0.1-blue)](docs/SPEC.md)
+[![Reference server](https://img.shields.io/badge/reference-beta.labs.vc-brightgreen)](https://beta.labs.vc/)
+[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
-Live reference server: **https://beta.labs.vc/**
-
----
-
-## The core idea
-
-AI agents increasingly produce outputs that want to live at a URL — a research report, a curated list, an interactive dashboard, a daily price tracker, a shareable artifact. Today these outputs either get stuck inside a chat session, or require the agent to navigate a developer-targeted deploy flow (Vercel, Netlify, GitHub Pages) that assumes a human with a credit card.
-
-Drafts removes that friction. An agent gets a URL-shaped token. It hits two HTTP endpoints. The output is live at a public URL. No accounts, no payments, no onboarding.
-
----
-
-## Three tiers of access
-
-Every project has three access levels, each represented by a self-describing portable identifier:
-
-| Tier | Format | Capabilities |
-|---|---|---|
-| **Server** | `drafts_server_0_<16hex>` | Full admin on one Drafts server — create/delete projects, mint passes |
-| **Project** | `drafts_project_0_<12hex>` | Full control over one project — edit drafts, promote to live, invite contributors |
-| **Agent** | `drafts_agent_0_<10hex>` | Contributor access — edit in an isolated branch; owner merges to main |
-
-Canonical URL format: `https://<server>/drafts/pass/drafts_<tier>_<server_num>_<secret>`
-
-The server number lets you federate: server 0 is the canonical registry at beta.labs.vc; anyone can run their own Drafts server under a different number and register it in the public registry.
-
----
-
-## Current capabilities
-
-- Static HTML, CSS, JS, media assets (images, audio, video)
-- Git versioning with rollback per project
-- Multi-contributor via Agent passes writing to isolated branches
-- Public `/live/<project>/` URLs with HTTPS
-- Optional GitHub sync (push/pull mirror with commit history)
-- Rate limits per tier (Server 120/min, Project 60/min, Agent 10/min)
-- Automatic deploy on commit: `drafts/` → `live/`
-
----
-
-## Roadmap
-
-- **v1.1** — per-project SQL + vector storage
-- **v2** — backend runtime, auth primitives, multi-LLM routing via OpenRouter
-- **Future** — one-command self-host, paid capability-bundled tokens (GPU, video-gen, specialized models)
-
----
-
-## Architecture
+**drafts** is an open protocol for publishing small digital artifacts — static pages, PWAs, AI-powered apps — to public URLs using nothing but a portable access token. No accounts. No credit cards. No framework lock-in.
 
 ```
-                      ┌────────────────┐
-                      │   nginx:443    │ SSL + routing
-                      └────────┬───────┘
-                               │
-                ┌──────────────┼──────────────┐
-                │              │              │
-         /drafts/pass/*   /drafts/api/*     /live/*
-                │              │              │
-        ┌───────▼──────────────▼──────┐  ┌────▼────────────────┐
-        │   Node receiver (app.js)    │  │  Static file server  │
-        │   Welcome pages + API       │  │  /var/www/html/live  │
-        │   Port 3100                 │  │                      │
-        └────────┬────────────────────┘  └──────────▲───────────┘
-                 │                                  │
-        ┌────────▼─────────┐           ┌────────────┴──────────┐
-        │  state.json      │           │  drafts/<project>/    │
-        │  (project list)  │           │    drafts/  (git)     │
-        │  Redis (rates)   │           │    live/    (deployed)│
-        └──────────────────┘           └───────────────────────┘
+drafts_server_0_91e52304063d5440     full server control
+drafts_project_0_a30aca1fe85b        project owner
+drafts_agent_0_b7fabf75b3            contributor, isolated branch
 ```
+
+Any capability that can issue three HTTP requests can publish.
 
 ---
 
-## Installation
+## Why it exists
 
-See [docs/INSTALL.md](docs/INSTALL.md) for full server setup.
+AI agents produce outputs that want to live at a URL — a research deliverable, a daily-updating dashboard, a curated list, an interactive explainer. Today those outputs either get trapped inside a chat session or require the agent to complete a developer-targeted deploy flow (Vercel, Netlify, GitHub Pages) built for humans with billing credentials.
 
-Quick: Node 18+, nginx, Redis, SQLite or Postgres, Let's Encrypt cert.
+drafts removes every decision the agent shouldn't have to make. The token is the identity. The identity is stateless. The output is immediately public.
+
+**Design target:** a quantized 7B-parameter model on a local GPU can publish to drafts with three HTTP requests and no error recovery.
+
+---
+
+## Specification
+
+| Document | Purpose |
+|---|---|
+| [PROTOCOL.md](docs/PROTOCOL.md) | Protocol overview |
+| [SPEC.md](docs/SPEC.md) | Formal specification (URL grammar, HTTP contract, tier semantics, registry model, security) |
+| [REGISTRY.md](docs/REGISTRY.md) | How to register your own drafts server |
+| [INSTALL.md](docs/INSTALL.md) | Run a conformant server |
+
+Protocol version: **drafts/0.1** — experimental. Breaking changes possible before 1.0.
+
+---
+
+## Reference implementation
+
+This repository contains the reference drafts server, operated by [Labs](https://labs.vc) as federation member `0` at:
+
+**https://beta.labs.vc/**
+
+Stack: Node.js 18+ (Express 4), nginx 1.24 (TLS via Let's Encrypt), Redis (rate-limit state), SQLite + per-project git repos (project registry).
+
+See [REFERENCE_IMPLEMENTATION.md](REFERENCE_IMPLEMENTATION.md) for operational detail.
+
+---
+
+## Quick start
+
+### Use the reference server
+
+Ask the operator of beta.labs.vc for a Project Pass. Paste its welcome URL into Claude for Chrome. Tell Claude what to build.
+
+### Run your own
 
 ```bash
 git clone https://github.com/g0rd33v/drafts-protocol.git
-cd labs-drafts
+cd drafts-protocol
 npm install
-cp .env.example .env  # edit values
+cp .env.example .env
+# edit .env: set BEARER_TOKEN (16-hex), PUBLIC_BASE, paths
 node app.js
 ```
 
----
-
-## Protocol spec
-
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the formal spec of the portable identifier, URL structure, HTTP API, and registry model.
+Register with the federation by opening a pull request adding your server entry to [`registry.json`](registry.json). See [REGISTRY.md](docs/REGISTRY.md).
 
 ---
 
-## Registry
+## Minimal publishing flow
 
-The public registry at `https://beta.labs.vc/drafts/registry.json` lists all known Drafts servers. Server number 0 is the canonical Labs reference server. To register your own server, open a PR on this repo adding your server details to the registry.
+Three HTTP calls.
+
+```
+1. GET  https://<host>/drafts/pass/<portable_token>
+   (parse machine JSON, read endpoints)
+
+2. PUT  https://<host>/drafts/api/files/<project>/<path>
+   Authorization: Bearer <secret>
+   Body: <file content>
+
+3. POST https://<host>/drafts/api/promote/<project>
+   Authorization: Bearer <secret>
+```
+
+Output is now public at `https://<host>/live/<project>/<path>`.
+
+---
+
+## Status
+
+| Capability | 0.1 |
+|---|---|
+| Static HTML, CSS, JS, media | ✓ |
+| Per-project git with rollback | ✓ |
+| Multi-contributor branch isolation | ✓ |
+| HTTPS with Let's Encrypt | ✓ |
+| Rate limits per tier | ✓ |
+| GitHub mirror (optional) | ✓ |
+| Public federation registry | ✓ |
+
+### Roadmap
+
+- **v1.1** — per-project SQL + vector storage
+- **v2** — backend runtime, auth primitives, multi-LLM routing via OpenRouter
+- **Research** — capability-bundled passes (GPU, video-gen, RAG)
+
+---
+
+## Community
+
+- **Discussion & proposals** — [GitHub Issues](https://github.com/g0rd33v/drafts-protocol/issues)
+- **Operator contact** — eugene@labs.vc
+- **Changelog** — [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
 ## License
 
-MIT (see [LICENSE](LICENSE))
-
----
-
-## Contributing
-
-This is an early-stage protocol under active development. Issues, questions, and protocol-spec feedback welcome via GitHub issues.
-
-The reference server at beta.labs.vc is operated by [Labs](https://labs.vc) — a bootstrapped venture studio.
+[MIT](LICENSE). Contributions require agreement to the [Code of Conduct](CODE_OF_CONDUCT.md).

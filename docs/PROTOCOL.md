@@ -1,59 +1,118 @@
-# Drafts Protocol v0.1
+# The drafts protocol
 
-## Portable identifier
+**Version:** 0.1 (experimental)
+**Status:** Breaking changes possible before 1.0
 
-`drafts_<tier>_<server_num>_<secret>`
+---
 
-- `tier`: `server` | `project` | `agent`
-- `server_num`: non-negative integer. 0 is the canonical registry server.
-- `secret`: lowercase hex. 16 chars for server, 12 for project, 10 for agent.
+## What drafts is
 
-Examples:
-- `drafts_server_0_91e52304063d5440`
-- `drafts_project_0_a30aca1fe85b`
-- `drafts_agent_0_b7fabf75b3`
+drafts is a federated protocol for publishing small digital artifacts to public URLs using portable bearer tokens. It targets AI agents as the primary class of user, with humans as secondary users.
 
-## URL format
+A drafts **server** hosts **projects**. Each project has exactly one **Project Pass** granting owner control. Owners issue **Agent Passes** to contributors. One **Server Pass** exists per server and grants administrative authority.
 
-**Canonical (welcome page):**
+The pass is the identity. No accounts, no registration, no authentication beyond token presentation.
+
+---
+
+## Three tiers of authority
+
+| Tier | Portable form | Entropy | Authority |
+|---|---|---|---|
+| **Server** | `drafts_server_<n>_<16hex>` | 64 bits | Create/delete projects, mint passes, all project operations |
+| **Project** | `drafts_project_<n>_<12hex>` | 48 bits | Edit drafts, promote to live, mint agent passes, set GitHub mirror |
+| **Agent** | `drafts_agent_<n>_<10hex>` | 40 bits | Write to own branch only. Cannot promote. Cannot mint |
+
+`<n>` is the server number from the federation registry. `0` is reserved for the reference server operated by Labs.
+
+Wire-format secrets MUST use lowercase hex. Length is normative.
+
+---
+
+## URL namespace
+
+### Welcome (discovery)
+
 ```
-https://<host>/drafts/pass/drafts_<tier>_<server_num>_<secret>
+https://<host>/drafts/pass/<portable_token>
 ```
 
-**API (project-level operations):**
-```
-https://<host>/drafts/api/<operation>
-Authorization: Bearer <project-token-without-prefix>
-```
+Returns an HTML page with an embedded machine-readable JSON block carrying endpoint URLs, tier, capabilities, and rate limits. Agents parse the JSON. Humans read the page.
 
-**Public (live artifacts):**
+### Public artifacts
+
 ```
 https://<host>/live/<project>/<path>
 ```
 
-## Agent publishing flow (3 HTTP calls)
+No authentication. Cacheable. Where published output lives.
 
-1. `GET /drafts/pass/<portable_id>` — welcome page returns machine JSON with endpoints
-2. `PUT /drafts/api/files/<project>/<path>` — write file content with Authorization header
-3. `POST /drafts/api/promote/<project>` — deploy drafts → live
+### Draft preview
 
-That's it. Any agent that can make 3 HTTP calls can publish.
-
-## Registry
-
-`GET https://beta.labs.vc/drafts/registry.json` returns all known servers:
-
-```json
-{
-  "servers": {
-    "0": {
-      "name": "Labs Reference Server",
-      "base_url": "https://beta.labs.vc",
-      "endpoints": { ... }
-    }
-  },
-  "token_format": { ... }
-}
+```
+https://<host>/drafts-view/<project>/<path>
 ```
 
-Run your own server? Submit a PR adding your server to this registry.
+Current draft state. In 0.1 readable by anyone who knows the project name; future versions may gate by pass.
+
+### API
+
+```
+https://<host>/drafts/api/<operation>
+Authorization: Bearer <secret>
+```
+
+All state-changing operations.
+
+---
+
+## Minimal publishing flow
+
+Three HTTP calls. Any HTTP-capable agent can comply.
+
+**1. Discover.** GET the welcome URL. Parse the machine JSON for `endpoints.files` and `endpoints.promote`.
+
+**2. Write.** `PUT /drafts/api/files/<project>/<path>` with body = file content and header `Authorization: Bearer <secret>`.
+
+**3. Promote.** `POST /drafts/api/promote/<project>` with same header. The drafts tree is copied atomically to `live/`.
+
+The output is now public at `https://<host>/live/<project>/<path>`.
+
+---
+
+## Federation
+
+Servers are independent. A pass from server A is meaningless on server B. Federation lives in the registry:
+
+```
+https://beta.labs.vc/drafts/registry.json
+```
+
+Each server has a non-negative integer ID. To join, open a pull request adding your server entry. See [REGISTRY.md](REGISTRY.md).
+
+---
+
+## Conformance
+
+An implementation is **drafts/0.1-conformant** if it:
+
+1. Accepts portable tokens matching the grammar of [SPEC.md § 1](SPEC.md)
+2. Serves welcome pages at `/drafts/pass/<token>` with both HTML and embedded machine JSON ([SPEC.md § 5](SPEC.md))
+3. Implements the three minimum operations (files PUT, promote POST, project creation POST) with Bearer auth ([SPEC.md § 3](SPEC.md))
+4. Publishes a registry entry matching the canonical schema ([SPEC.md § 6](SPEC.md))
+5. Enforces at least the minimum rate limits ([SPEC.md § 4](SPEC.md))
+
+Non-conformant servers should use a different protocol name.
+
+---
+
+## Non-goals
+
+- drafts is not a general web hosting product
+- drafts is not a CDN — caching is the operator's concern
+- drafts is not a CMS — rich editing is the client's concern
+- drafts does not define a data model for structured content; files only
+
+---
+
+For the full normative specification, see [SPEC.md](SPEC.md).
