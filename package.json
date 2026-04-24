@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
+    "dotenv": "^17.4.2",
     "express": "^4.19.0",
     "simple-git": "^3.25.0"
   }

@@ -1,0 +1,15 @@
+#!/bin/bash
+USER=g0rd33v
+ROOT=/var/www/html
+cd "$ROOT" || exit 1
+curl -sf "https://api.github.com/users/$USER/repos?per_page=100" | grep -oP "\"clone_url\":\s*\"\K[^\"]+" | while read URL; do
+    NAME=$(basename "$URL" .git)
+    if [ -d "$NAME/.git" ]; then
+        cd "$NAME" && git pull -q && cd ..
+    else
+        git clone -q "$URL"
+    fi
+done
+chown -R www-data:www-data "$ROOT"
+find "$ROOT" -type d -exec chmod 755 {} \;
+find "$ROOT" -type f -exec chmod 644 {} \;

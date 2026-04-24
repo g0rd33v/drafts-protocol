@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Status collector — writes /var/www/html/status/data.json every minute."""
+import json, os, subprocess, urllib.request, re
+from datetime import datetime, timezone
+from pathlib import Path
+
+GH_USER = 'g0rd33v'
+OUT = '/var/www/html/status/data.json'
+TOKEN = Path('/etc/labs/github_token').read_text().strip() if Path('/etc/labs/github_token').exists() else ''
+
+def sh(c, t=8):
+    try: return subprocess.run(c, shell=True, capture_output=True, text=True, timeout=t).stdout.strip()
+    except: return ''
+
+def gh(path):
+    req = urllib.request.Request('https://api.github.com' + path,
+        headers={'Authorization': f'Bearer {TOKEN}', 'Accept': 'application/vnd.github+json', 'User-Agent': 'labs-status'})
+    try:
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {'_error': str(e)}
+
+def v(cmd, pat):
+    out = sh(cmd + ' 2>&1', 3)
+    m = re.search(pat, out)
+    return m.group(1) if m else '—'
+
+ssl_days = 0
+raw = sh('echo | openssl s_client -connect beta.labs.vc:443 -servername beta.labs.vc 2>/dev/null | openssl x509 -noout -enddate', 5)
+if '=' in raw:
+    try:
+        dt = datetime.strptime(raw.split('=',1)[1], '%b %d %H:%M:%S %Y %Z')
+        ssl_days = max(0, (dt - datetime.utcnow()).days)
+    except: pass
+
+osname = '—'
+try:
+    for line in Path('/etc/os-release').read_text().splitlines():
+        if line.startswith('PRETTY_NAME='): osname = line.split('=',1)[1].strip().strip('"')
+except: pass
+
+services = {}
+for s in ['nginx','cron','ssh','fail2ban','cockpit.socket','unattended-upgrades','redis-server']:
+    services[s] = sh(f'systemctl is-active {s}') or 'unknown'
+
+sites = {}
+for path, slug in [('','root'),('silence','silence'),('zeus-protocol','zeus-protocol'),('wizrag','wizrag'),('party','party'),('qoin','qoin')]:
+    c = sh(f'curl -sI -o /dev/null -w "%{{http_code}}" --max-time 5 https://beta.labs.vc/{path}/')
+    sites[slug] = int(c) if c.isdigit() else 0
+
+versions = {
+    'nginx': v('nginx -v', r'nginx/([\d.]+)'),
+    'git': v('git --version', r'([\d.]+)'),
+    'node': v('node --version', r'v?([\d.]+)'),
+    'python3': v('python3 --version', r'([\d.]+)'),
+    'redis-server': v('redis-server --version', r'v=([\d.]+)'),
+    'certbot': v('certbot --version', r'([\d.]+)'),
+    'cockpit.socket': v('cockpit-bridge --version', r'([\d.]+)'),
+    'fail2ban': v('fail2ban-server --version', r'v([\d.]+)'),
+    'ssh': v('ssh -V', r'OpenSSH_([\d.]+)'),
+    'cron': v('dpkg -s cron', r'Version:\s*([\d.a-z-]+)'),
+    'unattended-upgrades': v('dpkg -s unattended-upgrades', r'Version:\s*([\d.a-z-]+)'),
+}
+
+projects = []
+repos = gh(f'/users/{GH_USER}/repos?per_page=100&sort=pushed')
+if isinstance(repos, list):
+    for r in repos:
+        if r.get('fork'): continue
+        name = r['name']
+        branch = r.get('default_branch','main')
+        c = gh(f'/repos/{GH_USER}/{name}/commits/{branch}')
+        gh_sha = c.get('sha','') if isinstance(c, dict) else ''
+        repo_dir = Path('/var/www/html') / name
+        synced_sha = sh(f'git -C {repo_dir} rev-parse HEAD', 3) if (repo_dir / '.git').exists() else ''
+        synced_at = sh(f'git -C {repo_dir} log -1 --format=%cI', 3) if (repo_dir / '.git').exists() else ''
+        projects.append({
+            'name': name,
+            'github_sha': gh_sha,
+            'github_pushed_at': r.get('pushed_at',''),
+            'description': r.get('description',''),
+            'language': r.get('language',''),
+            'synced_sha': synced_sha,
+            'synced_at': synced_at,
+            'beta_url': f'https://beta.labs.vc/{name}/' if repo_dir.exists() else None,
+            'github_url': r.get('html_url','')
+        })
+
+rate = gh('/rate_limit')
+rate_remaining = rate.get('resources',{}).get('core',{}).get('remaining',0) if isinstance(rate, dict) else 0
+
+data = {
+    'generated_at': datetime.now(timezone.utc).isoformat(),
+    'server': {
+        'uptime': sh('uptime -p').replace('up ',''),
+        'load': ' '.join(Path('/proc/loadavg').read_text().split()[:3]),
+        'mem': sh("free -h | awk '/^Mem:/ {printf \"%s / %s\", $3, $2}'"),
+        'disk': sh("df -h / | awk 'NR==2 {print $5}'"),
+        'os': osname,
+        'kernel': sh('uname -r'),
+        'ssl_days': ssl_days
+    },
+    'github': {'user': GH_USER, 'rate_remaining': rate_remaining},
+    'services': services,
+    'sites': sites,
+    'versions': versions,
+    'sync': {
+        'script_ok': os.access('/usr/local/bin/labs-sync', os.X_OK),
+        'cron_registered': 'labs-sync' in sh('crontab -l', 3)
+    },
+    'projects': projects
+}
+
+Path(OUT).parent.mkdir(parents=True, exist_ok=True)
+Path(OUT).write_text(json.dumps(data, indent=2))
+os.chmod(OUT, 0o644)

@@ -1,147 +1,119 @@
-# drafts
+# Drafts
 
-**Build and publish, just by talking.**
+> **The publishing layer for AI-generated artifacts.** Turn any conversation with an AI agent into a live, persistent, public URL — with no signup, no code, no friction.
 
-Drafts turns any Claude conversation into a workspace where you ship real websites, progressive web apps, and AI tools. No registration. No coding. No vibe coding. Just vibe.
+Drafts is a protocol + reference server for letting AI agents (and humans) publish websites, pages, PWAs, and AI-powered apps to public URLs using nothing but a passable link as their identity.
 
-Live at **[beta.labs.vc](https://beta.labs.vc/drafts/)** — the canonical server (`drafts_0`).
-
----
-
-## What it is
-
-A lightweight server that sits between Claude and the public web. You get a personal portable link. You drop it into the Claude for Chrome extension sidebar. Claude reads the page, parses embedded machine-readable instructions, takes on the right level of access automatically, and is ready to build.
-
-Then you talk.
-
-> "Make me a landing page for a running club."
-> "Add a signup form."
-> "Make the header feel more like Apple."
-> "Publish."
-
-Minutes later — sometimes seconds — it is live at a public URL.
+Live reference server: **https://beta.labs.vc/**
 
 ---
 
-## The portable link format
+## The core idea
 
-Every Drafts link follows one pattern:
+AI agents increasingly produce outputs that want to live at a URL — a research report, a curated list, an interactive dashboard, a daily price tracker, a shareable artifact. Today these outputs either get stuck inside a chat session, or require the agent to navigate a developer-targeted deploy flow (Vercel, Netlify, GitHub Pages) that assumes a human with a credit card.
+
+Drafts removes that friction. An agent gets a URL-shaped token. It hits two HTTP endpoints. The output is live at a public URL. No accounts, no payments, no onboarding.
+
+---
+
+## Three tiers of access
+
+Every project has three access levels, each represented by a self-describing portable identifier:
+
+| Tier | Format | Capabilities |
+|---|---|---|
+| **Server** | `drafts_server_0_<16hex>` | Full admin on one Drafts server — create/delete projects, mint passes |
+| **Project** | `drafts_project_0_<12hex>` | Full control over one project — edit drafts, promote to live, invite contributors |
+| **Agent** | `drafts_agent_0_<10hex>` | Contributor access — edit in an isolated branch; owner merges to main |
+
+Canonical URL format: `https://<server>/drafts/pass/drafts_<tier>_<server_num>_<secret>`
+
+The server number lets you federate: server 0 is the canonical registry at beta.labs.vc; anyone can run their own Drafts server under a different number and register it in the public registry.
+
+---
+
+## Current capabilities
+
+- Static HTML, CSS, JS, media assets (images, audio, video)
+- Git versioning with rollback per project
+- Multi-contributor via Agent passes writing to isolated branches
+- Public `/live/<project>/` URLs with HTTPS
+- Optional GitHub sync (push/pull mirror with commit history)
+- Rate limits per tier (Server 120/min, Project 60/min, Agent 10/min)
+- Automatic deploy on commit: `drafts/` → `live/`
+
+---
+
+## Roadmap
+
+- **v1.1** — per-project SQL + vector storage
+- **v2** — backend runtime, auth primitives, multi-LLM routing via OpenRouter
+- **Future** — one-command self-host, paid capability-bundled tokens (GPU, video-gen, specialized models)
+
+---
+
+## Architecture
 
 ```
-drafts_<server_number>_<token>
+                      ┌────────────────┐
+                      │   nginx:443    │ SSL + routing
+                      └────────┬───────┘
+                               │
+                ┌──────────────┼──────────────┐
+                │              │              │
+         /drafts/pass/*   /drafts/api/*     /live/*
+                │              │              │
+        ┌───────▼──────────────▼──────┐  ┌────▼────────────────┐
+        │   Node receiver (app.js)    │  │  Static file server  │
+        │   Welcome pages + API       │  │  /var/www/html/live  │
+        │   Port 3100                 │  │                      │
+        └────────┬────────────────────┘  └──────────▲───────────┘
+                 │                                  │
+        ┌────────▼─────────┐           ┌────────────┴──────────┐
+        │  state.json      │           │  drafts/<project>/    │
+        │  (project list)  │           │    drafts/  (git)     │
+        │  Redis (rates)   │           │    live/    (deployed)│
+        └──────────────────┘           └───────────────────────┘
 ```
 
-Three parts, readable at a glance:
+---
 
-- **`drafts`** — the protocol. Always.
-- **`<server_number>`** — which Drafts server hosts this project. `0` is the canonical server at [beta.labs.vc](https://beta.labs.vc). Other operators run 1, 2, 3… declared in the public registry.
-- **`<token>`** — the access credential. Its prefix reveals the tier automatically: `pap_` = project owner, `aap_` = contributor, otherwise = server root.
+## Installation
 
-Example links:
+See [docs/INSTALL.md](docs/INSTALL.md) for full server setup.
 
+Quick: Node 18+, nginx, Redis, SQLite or Postgres, Let's Encrypt cert.
+
+```bash
+git clone https://github.com/g0rd33v/labs-drafts.git
+cd labs-drafts
+npm install
+cp .env.example .env  # edit values
+node app.js
 ```
-drafts_0_<64hex>                 → SAP (server root)
-drafts_0_pap_<48hex>             → PAP (project owner)
-drafts_0_aap_<48hex>             → AAP (contributor)
-```
-
-One link tells any Claude everything it needs: which server, which tier, which project. No lookups required.
-
-### The registry
-
-Drafts maintains a public registry at [**beta.labs.vc/drafts/registry.json**](https://beta.labs.vc/drafts/registry.json) listing every registered Drafts server. Want to run your own instance and claim a number? Open a PR against this repository — the registry is owned and maintained by Drafts itself.
 
 ---
 
-## What you need
+## Protocol spec
 
-1. **Anthropic Claude**, any plan (Free works), logged in in Chrome
-2. **[Claude for Chrome extension](https://chromewebstore.google.com/detail/claude-for-chrome/fmpnliohjhemenmnlpbfagaolkdacoja)**
-3. **A drafts link** — your personal `drafts_0_…` identifier
-
-That is the entire stack.
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the formal spec of the portable identifier, URL structure, HTTP API, and registry model.
 
 ---
 
-## What it does today
+## Registry
 
-- **Unlimited projects.** Websites, PWAs, AI-powered tools — anything that lives at a URL.
-- **Public URLs out of the box.** Every project lives at a clean address the moment you publish.
-- **Stunning output.** Claude generates production-quality HTML, CSS, JS — fast, adaptive, mobile-ready. Full interactivity, animations, forms, third-party embeds.
-- **Git-versioned.** Every change tracked. Rollback is one sentence away.
-- **Two zones per project.** A `drafts/` working zone for iteration; a `live/` zone for the public version. Atomic promote when you are ready.
-- **Collaboration by link.** Invite unlimited contributors — each one gets their own isolated branch. You review and merge. No shared passwords, no Figma invites, no GitHub permissions.
-- **Optional GitHub sync.** Push to your own repo when you want to deploy elsewhere too.
-- **Zero registration.** Your Claude login is your entire identity.
-
----
-
-## Coming soon
-
-- **Databases.** SQL for user data. Vector storage for knowledge bases.
-- **Multi-LLM.** Use any model while building, or let your visitors pick theirs.
-- **Self-hosted Drafts.** One-command install on any VPS. Claim a number in the registry.
-- **Deployment bridges.** Beyond GitHub — to wherever your code lives.
-
----
-
-## Three-tier access model
-
-Drafts uses a simple hierarchy based on the portable link format:
-
-| Tier | Link format | Who | Scope |
-|---|---|---|---|
-| **SAP** — Server API Pass | `drafts_<N>_<64hex>` | Server operator | Root. Create/delete any project, mint PAPs. One per server. |
-| **PAP** — Project API Pass | `drafts_<N>_pap_<48hex>` | Project owner | One project. Mint AAPs, merge contributions, publish, rollback. |
-| **AAP** — Agent API Pass | `drafts_<N>_aap_<48hex>` | Contributor or AI agent | One project. Writes to an isolated `aap/<id>` branch. Owner reviews and merges. |
-
-Each link opens to a welcome page containing a machine-readable instruction block. Claude reads this on first load and knows instantly:
-
-- What tier it is operating at
-- Which server it is speaking to
-- Which endpoints are available
-- How to interpret natural language user intent
-- How to verify work after publishing
-
-No UI dashboards. No control panels. All control plane flows through Claude chat.
-
----
-
-## Stack
-
-- **Node 18** + **Express** + **simple-git**
-- **nginx** for TLS, static serving, and reverse proxy
-- **pm2** for process management
-- **Git** for versioning (local repos per project, optional GitHub mirror)
-- **Let's Encrypt** for SSL
-- **Flat JSON state** at `.state.json` — no database required
-
----
-
-## Rate limits
-
-Hardcoded, Claude Code style. Tier-based sliding windows:
-
-| Tier | per minute | per hour | per day |
-|---|---|---|---|
-| SAP | 120 | 2,000 | 20,000 |
-| PAP | 60 | 600 | 5,000 |
-| AAP | 10 | 60 | 300 |
-
-Over-limit requests get `HTTP 429` with `Retry-After`.
-
----
-
-## Status
-
-**v0.3 — live in beta** at [beta.labs.vc](https://beta.labs.vc/drafts/). Canonical server is `drafts_0`.
+The public registry at `https://beta.labs.vc/drafts/registry.json` lists all known Drafts servers. Server number 0 is the canonical Labs reference server. To register your own server, open a PR on this repo adding your server details to the registry.
 
 ---
 
 ## License
 
-MIT.
+MIT (see [LICENSE](LICENSE))
 
 ---
 
-*Part of [labs.vc](https://labs.vc). Built in the open.*
+## Contributing
+
+This is an early-stage protocol under active development. Issues, questions, and protocol-spec feedback welcome via GitHub issues.
+
+The reference server at beta.labs.vc is operated by [Labs](https://labs.vc) — a bootstrapped venture studio.

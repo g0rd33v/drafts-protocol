@@ -1,0 +1,39 @@
+#!/bin/bash
+# labs-github-sync: pull from GitHub for projects with github_repo, redeploy /live/ if changed
+LOG=/var/log/drafts-github-sync.log
+python3 << 'PYEOF' 2>&1 | tee -a "$LOG"
+import json, subprocess, os, shutil
+from datetime import datetime
+
+ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+state = json.load(open('/var/www/beta.labs.vc/drafts/.state.json'))
+changed_count = 0
+for p in state['projects']:
+    if not p.get('github_repo'):
+        continue
+    name = p['name']
+    drafts_dir = f'/var/www/beta.labs.vc/drafts/{name}/drafts'
+    live_dir = f'/var/www/beta.labs.vc/drafts/{name}/live'
+    if not os.path.exists(os.path.join(drafts_dir, '.git')):
+        continue
+    
+    before = subprocess.run(['git', '-C', drafts_dir, 'rev-parse', 'HEAD'],
+                            capture_output=True, text=True).stdout.strip()
+    
+    pull = subprocess.run(['git', '-C', drafts_dir, 'pull', '--ff-only', 'origin'],
+                          capture_output=True, text=True, timeout=60)
+    
+    after = subprocess.run(['git', '-C', drafts_dir, 'rev-parse', 'HEAD'],
+                           capture_output=True, text=True).stdout.strip()
+    
+    if before != after:
+        if os.path.exists(live_dir):
+            shutil.rmtree(live_dir)
+        shutil.copytree(drafts_dir, live_dir, ignore=shutil.ignore_patterns('.git'))
+        subprocess.run(['chown', '-R', 'www-data:www-data', live_dir])
+        print(f'[{ts}] {name}: {before[:8]} -> {after[:8]} redeployed')
+        changed_count += 1
+
+if changed_count == 0:
+    print(f'[{ts}] no changes')
+PYEOF

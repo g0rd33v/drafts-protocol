@@ -1,0 +1,70 @@
+#!/bin/bash
+GH_TOKEN=$(cat /etc/labs/github_token)
+
+python3 << PYEOF
+import json, urllib.request, os, subprocess
+TOKEN = open('/etc/labs/github_token').read().strip()
+PUBLIC_REPOS = "labs-drafts beta silence wizrag zeus-protocol qoin party".split()
+DRAFTS_DIR = '/var/www/beta.labs.vc/drafts'
+STATE = '/var/www/beta.labs.vc/drafts/.state.json'
+OUTPUT = '/var/www/html/drafts/repos.json'
+
+def gh(url):
+    req = urllib.request.Request(url, headers={
+        'Authorization': 'Bearer ' + TOKEN,
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'beta.labs.vc'
+    })
+    return json.loads(urllib.request.urlopen(req).read())
+
+github_repos = []
+for name in PUBLIC_REPOS:
+    try:
+        r = gh(f'https://api.github.com/repos/g0rd33v/{name}')
+        commits = gh(f'https://api.github.com/repos/g0rd33v/{name}/commits?per_page=1')
+        last = commits[0] if commits else None
+        github_repos.append({
+            'name': r['name'],
+            'description': r.get('description') or '',
+            'full_name': r['full_name'],
+            'html_url': r['html_url'],
+            'pushed_at': r['pushed_at'],
+            'stars': r['stargazers_count'],
+            'language': r.get('language') or '',
+            'branch': r.get('default_branch', 'main'),
+            'commit_msg': (last['commit']['message'].split(chr(10))[0] if last else ''),
+            'commit_sha': (last['sha'][:7] if last else ''),
+            'commit_date': (last['commit']['author']['date'] if last else r['pushed_at']),
+        })
+    except Exception as e:
+        pass
+
+projects = []
+try:
+    s = json.load(open(STATE))
+    for p in s.get('projects', []):
+        live_dir = os.path.join(DRAFTS_DIR, p['name'], 'live')
+        file_count = 0
+        if os.path.isdir(live_dir):
+            for f in os.listdir(live_dir):
+                if not f.startswith('.') and os.path.isfile(os.path.join(live_dir, f)):
+                    file_count += 1
+        if file_count > 0:
+            projects.append({
+                'name': p['name'],
+                'description': p.get('description') or 'A project built on drafts.',
+                'live_url': '/live/' + p['name'] + '/',
+                'file_count': file_count,
+                'created_at': p.get('created_at', ''),
+            })
+except Exception as e:
+    pass
+
+output = {
+    'generated_at': subprocess.check_output(['date', '-u', '+%Y-%m-%dT%H:%M:%SZ']).decode().strip(),
+    'projects': projects,
+    'github_repos': github_repos,
+}
+json.dump(output, open(OUTPUT, 'w'), indent=2)
+print('repos.json updated: ' + str(len(projects)) + ' projects, ' + str(len(github_repos)) + ' github repos')
+PYEOF

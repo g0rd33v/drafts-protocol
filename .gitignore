@@ -1,17 +1,8 @@
 node_modules/
 .env
 *.log
-npm-debug.log*
-# local state and project data
-state.json
 data/
-drafts/
-live/
-# backups and old versions
-app.v*.js
-*.bak
-*.bak.js
-# macOS / editor
-.DS_Store
-.vscode/
-.idea/
+logs/
+backup/
+*.bak.*
+pre-*.js
