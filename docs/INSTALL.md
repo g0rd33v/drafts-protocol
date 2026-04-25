@@ -1,124 +1,118 @@
-# Installation
+# Installing drafts
 
-Run a conformant drafts/0.1 server.
+## Recommended: one-command installer
 
-## Requirements
-
-- Node.js 18+
-- nginx 1.24+
-- Redis 6+ (rate-limit state; optional for small deployments with in-memory fallback)
-- SQLite 3+ or a JSON file for project state
-- Let's Encrypt / certbot for TLS
-- 1 GB RAM minimum, 2 GB recommended
-- Linux recommended (tested on Ubuntu 24.04)
-
-## Clone and install
+On a fresh Ubuntu 22.04 or 24.04 VPS, as root:
 
 ```bash
-git clone https://github.com/g0rd33v/drafts-protocol.git /opt/drafts-receiver
-cd /opt/drafts-receiver
-npm install --production
-cp .env.example .env
+curl -fsSL https://raw.githubusercontent.com/g0rd33v/drafts-protocol/main/install.sh \
+  | bash -s drafts.example.com admin@example.com
 ```
 
-## Configure
+Two arguments:
 
-Edit `.env`:
+1. **Domain** — public hostname pointing at this VPS. Add the A record and wait for it to propagate before running.
+2. **Email** — used by Let's Encrypt for cert registration and renewal warnings.
 
-```env
-BEARER_TOKEN=<generate with: openssl rand -hex 8>
-STATE_FILE=/var/www/beta.labs.vc/drafts/.state.json
-PUBLIC_BASE=https://your.domain
+What the installer does, in order:
+
+1. Detects Ubuntu version. Continues with a warning on other distros.
+2. Verifies the domain resolves to this VPS's public IP. Aborts if it doesn't.
+3. `apt install` nginx, certbot, python3-certbot-nginx, git, curl.
+4. Installs Node.js 20 from NodeSource (skipped if Node 18+ already present).
+5. Installs `pm2` globally (skipped if already present).
+6. Clones `g0rd33v/drafts-protocol` to `/opt/drafts`.
+7. Runs `npm install`.
+8. Writes `/etc/labs/drafts.env` with `PUBLIC_BASE_URL` set to your domain.
+9. Configures nginx as reverse proxy (port 80, with `/live/*` and `/drafts-view/*` served as static).
+10. Issues HTTPS cert via certbot. Falls back to HTTP-only if Let's Encrypt fails (you can re-run certbot later).
+11. Starts `drafts.js` under pm2 with `--name drafts`. Saves the pm2 process list and registers the systemd boot hook.
+12. Hits `/drafts/health` to verify.
+13. Reads the freshly minted SAP token from `/etc/labs/drafts.sap` and prints it once with example commands.
+
+Total time on a $4/mo VPS: 2–3 minutes.
+
+## Prerequisites
+
+- Fresh Ubuntu 22.04 or 24.04 VPS (other distros may work; tested only on Ubuntu)
+- Public IPv4 with port 80 + 443 open to the internet
+- A domain with A record pointing at the VPS IP, propagated (verify with `dig <domain>`)
+- Root SSH access
+- ~512 MB RAM, ~5 GB disk minimum (drafts itself uses very little; budget for project file storage)
+
+## Manual install
+
+If you want to do it yourself instead of running the installer:
+
+```bash
+# As root on Ubuntu 22.04+
+apt update && apt install -y curl git nginx certbot python3-certbot-nginx
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt install -y nodejs
+npm install -g pm2
+
+git clone https://github.com/g0rd33v/drafts-protocol.git /opt/drafts
+cd /opt/drafts
+npm install
+
+mkdir -p /etc/labs /var/lib/drafts
+cat > /etc/labs/drafts.env <<EOF
+PUBLIC_BASE_URL=https://drafts.example.com
+SERVER_NUMBER=0
 PORT=3100
-REDIS_URL=redis://127.0.0.1:6379
+DRAFTS_DIR=/var/lib/drafts
+EOF
+chmod 600 /etc/labs/drafts.env
+
+# nginx config — see install.sh for the full template
+# certbot --nginx -d drafts.example.com -m admin@example.com --agree-tos --non-interactive
+
+pm2 start /opt/drafts/drafts.js --name drafts
+pm2 save
+pm2 startup
+# Save the SAP printed at startup, or read from /etc/labs/drafts.sap
 ```
 
-Generate your server pass:
+## After install
+
+The installer prints your SAP token once. Save it. To create a project:
 
 ```bash
-openssl rand -hex 8   # 16-hex characters = 64-bit entropy
-```
-
-Store it in `BEARER_TOKEN` and keep it secret. You will use it to create your first project.
-
-## nginx
-
-Example config at `deploy/nginx.conf`. Key blocks:
-
-```nginx
-location /drafts/ {
-    proxy_pass http://127.0.0.1:3100;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-}
-
-location /live/ {
-    alias /var/www/html/live/;
-    try_files \$uri \$uri/ =404;
-}
-```
-
-## systemd
-
-```ini
-# /etc/systemd/system/drafts-receiver.service
-[Unit]
-Description=drafts receiver (reference implementation)
-After=network.target
-
-[Service]
-Type=simple
-User=www-data
-WorkingDirectory=/opt/drafts-receiver
-EnvironmentFile=/opt/drafts-receiver/.env
-ExecStart=/usr/bin/node /opt/drafts-receiver/app.js
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl enable --now drafts-receiver
-systemctl status drafts-receiver
-```
-
-## Verify
-
-```bash
-curl -o /dev/null -w '%{http_code}\n' "https://your.domain/drafts/pass/drafts_server_0_<your_token>"
-# Expect: 200
-```
-
-## Create your first project
-
-```bash
-curl -X POST https://your.domain/drafts/projects \
-  -H "Authorization: Bearer <SERVER_TOKEN>" \
+SAP=$(cat /etc/labs/drafts.sap)
+curl -X POST https://drafts.example.com/drafts/projects \
+  -H "Authorization: Bearer $SAP" \
   -H "Content-Type: application/json" \
-  -d '{"name":"hello","description":"My first drafts project"}'
+  -d '{"name":"hello","description":"first project"}'
 ```
 
-Response contains the Project Pass. Share that URL with the project owner.
+The response contains a `pap_activation_url`. Hand that link to anyone — they paste it into Claude for Chrome and start building.
 
-## Register with the federation
+To enable GitHub mirroring of projects, configure once via the API:
 
-See [REGISTRY.md](REGISTRY.md).
+```bash
+# Server-default GitHub credentials (used by all projects unless overridden)
+curl -X PUT https://drafts.example.com/drafts/config/github \
+  -H "Authorization: Bearer $SAP" \
+  -H "Content-Type: application/json" \
+  -d '{"user":"yourname","token":"ghp_xxxxxxxxxxxx"}'
 
-## Operational scripts
-
-`deploy/bin/` contains cron and ops scripts:
-
-- `labs-sync` — deploy drafts → live for one project
-- `labs-github-sync` — pull changes from GitHub for projects with mirror enabled
-- `labs-drafts-refresh` — regenerate directory metadata
-- `labs-status-collect` — emit health metrics
-
-Install to `/usr/local/bin/`, wire up with cron (see [REFERENCE_IMPLEMENTATION.md](../REFERENCE_IMPLEMENTATION.md)).
+# Per-project override (use a different account for one project)
+curl -X PUT https://drafts.example.com/drafts/projects/hello/config/github \
+  -H "Authorization: Bearer $SAP" \
+  -H "Content-Type: application/json" \
+  -d '{"user":"otherusername","token":"ghp_yyyyyyyyyyyy"}'
+```
 
 ## Troubleshooting
 
-- **401 on welcome page** — check secret length matches tier (16/12/10 hex)
-- **502 from nginx** — receiver not running, check `systemctl status drafts-receiver`
-- **403 on `/live/`** — check nginx `alias` path and directory permissions (www-data:www-data)
+**`certbot` fails:** DNS isn't propagated, or ports 80/443 are blocked. Re-run `certbot --nginx -d drafts.example.com -m admin@example.com` after fixing.
+
+**`/drafts/health` returns 502:** The Node process didn't start. Check `pm2 logs drafts`.
+
+**SAP token not printed:** Look at `/etc/labs/drafts.sap` — the file is created on first run with mode 0600.
+
+**Re-run installer:** Safe. The script is idempotent — it won't overwrite an existing `/etc/labs/drafts.env` or replace your data, only update code and config templates.
+
+## Registering a public server number
+
+Local installs use `SERVER_NUMBER=0` by default. Number 0 is the universal "unregistered" slot. To claim a public number, open a pull request adding your server entry to [`drafts-registry.json`](../drafts-registry.json) in this repo. After merge, edit `/etc/labs/drafts.env`, set `SERVER_NUMBER=<your_number>`, restart with `pm2 restart drafts`. Existing tokens stay valid; new tokens use the new number.
