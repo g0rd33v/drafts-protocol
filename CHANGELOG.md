@@ -20,6 +20,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versio
 - **Server number embedded in welcome URLs** — all minted URLs now use `${SERVER_NUMBER}` instead of hardcoded `0`. Server number is local-only; claim a federation number via PR.
 - **Welcome banner cleaned** — startup logs print as `drafts v0.2`, dropping the legacy `drafts-receiver v2.0` framing.
 
+### Documentation (post-installer sweep)
+
+- **`REFERENCE_IMPLEMENTATION.md`** — updated to drafts.js + pm2; dropped stale Redis claim; documented new GitHub-config-via-API surface.
+- **`docs/PROTOCOL.md`** — registry now points at GitHub-hosted file (per-server endpoint removed); documented server `0` as both reference and local-default.
+- **`docs/SPEC.md`** — §6.1 federation registry rewritten for GitHub hosting; new §3.7 documents GitHub-config-via-API; §1, §6.2 document server `0` dual purpose; §8.1 upgrade-path notes the registry endpoint removal; editorial note added at top describing the §3 implementation drift to be reconciled in 0.3.
+- **`docs/REGISTRY.md`** — full rewrite for the GitHub-hosted registry flow, drafts/0.2, current install path, server `0` semantics.
+
+### Known divergence (not blocking)
+
+The reference implementation `drafts.js` does not yet match the API surface that SPEC.md §3 describes (`POST /drafts/upload` with `filename` body vs spec'd `PUT /drafts/api/files/<project>/<path>`; no `POST /drafts/api/rotate` endpoint exists yet). Third parties building against drafts/0.2 today should treat the reference implementation's welcome-page machine JSON as the source of truth for endpoint paths. Reconciliation is queued for 0.3 — either by aligning the reference to the spec, or by updating §3 to match what ships.
+
 ## [0.2] — 2026-04-24
 
 ### Protocol (breaking)
