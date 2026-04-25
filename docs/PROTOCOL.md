@@ -3,6 +3,7 @@
 **Version:** 0.2 (experimental)
 **Status:** Breaking changes possible before 1.0
 **Formal spec:** [SPEC.md](SPEC.md)
+**Reference implementation:** [`drafts.js`](../drafts.js)
 
 ---
 
@@ -32,8 +33,8 @@ If a simplification helps the weakest agent succeed, it wins. If a feature would
 
 | Tier | Portable form | Entropy | Authority |
 |---|---|---|---|
-| **Server** | `drafts_server_<n>_<16hex>` | 64 bits | Create/delete projects, mint passes, all project operations |
-| **Project** | `drafts_project_<n>_<12hex>` | 48 bits | Edit drafts, promote to live, mint agent passes, set GitHub mirror, rotate own pass |
+| **Server** | `drafts_server_<n>_<16hex>` | 64 bits | Create/delete projects, mint passes, all project operations, configure server-default GitHub credentials |
+| **Project** | `drafts_project_<n>_<12hex>` | 48 bits | Edit drafts, promote to live, mint agent passes, merge agent branches, set per-project GitHub credentials |
 | **Agent** | `drafts_agent_<n>_<10hex>` | 40 bits | Write to own branch only. Cannot promote. Cannot mint |
 
 `<n>` is the server number from the federation registry. `0` is reserved for the reference server operated by Labs **and** is the default for local/unregistered installs.
@@ -50,7 +51,7 @@ Wire-format secrets MUST use lowercase hex. Length is normative.
 https://<host>/drafts/pass/<portable_token>
 ```
 
-Returns an HTML page with an embedded machine-readable JSON block carrying endpoint URLs, tier, capabilities, and rate limits. Agents parse the JSON. Humans read the page.
+Returns an HTML page with an embedded machine-readable JSON block (in `<script id="claude-instructions">`) carrying tier, the internal-form token to use in `Authorization` headers, the full filtered endpoint list, and capabilities. Agents parse the JSON. Humans read the page.
 
 ### Public artifacts
 
@@ -66,16 +67,11 @@ No authentication. Cacheable. Where the artifact lives for readers.
 https://<host>/drafts-view/<project>/<path>
 ```
 
-Current draft state. In 0.2 readable by anyone who knows the project name; future versions may gate by pass.
+Current draft state (the project's `main` branch). In 0.2 readable by anyone who knows the project name.
 
 ### API
 
-```
-https://<host>/drafts/api/<operation>
-Authorization: Bearer <secret>
-```
-
-All state-changing operations.
+All operations live under `/drafts/...` (not `/drafts/api/...`). Authorisation is `Bearer <internal-form token>` from the welcome page's machine JSON.
 
 ---
 
@@ -83,13 +79,15 @@ All state-changing operations.
 
 Three HTTP calls. Any HTTP-capable agent can comply.
 
-**1. Discover.** GET the welcome URL. Parse the machine JSON for `endpoints.files` and `endpoints.promote`.
+**1. Discover.** `GET /drafts/pass/<portable_token>`. Parse the embedded machine JSON for `auth.token` and the endpoint list.
 
-**2. Write.** `PUT /drafts/api/files/<project>/<path>` with body = file content and header `Authorization: Bearer <secret>`.
+**2. Write.** `POST /drafts/upload` with body `{"filename": "<path>", "content": "<text>"}` and header `Authorization: Bearer <auth.token>`.
 
-**3. Promote.** `POST /drafts/api/promote/<project>` with same header. The drafts tree is copied atomically to `live/`.
+**3. Promote.** `POST /drafts/promote` with same header. The drafts tree is copied atomically to `live/`.
 
 The artifact is now public at `https://<host>/live/<project>/<path>`.
+
+For all other operations — list files, mint agent passes, merge branches, configure GitHub sync — see [SPEC.md §3](SPEC.md).
 
 ---
 
@@ -98,8 +96,8 @@ The artifact is now public at `https://<host>/live/<project>/<path>`.
 A single artifact can pass between multiple agents.
 
 - An **LLM** creates the first version through a Project Pass. The output is public.
-- Another **LLM** receives the same URL, reads the current state, and commits changes through an Agent Pass. Its changes are on an isolated branch.
-- The **project owner** reviews the changes via `POST /drafts/api/merge/<project>` and either merges the branch or discards it.
+- Another **LLM** receives the same URL, reads the current state, and commits changes through an Agent Pass. Its changes are on an isolated branch (`aap/<id>`).
+- The **project owner** lists pending contributions via `GET /drafts/pending`, then merges via `POST /drafts/merge` with `{"aap_id": "<id>"}`.
 - A **human collaborator** opens the URL in a browser, tweaks the content or logic directly through their own pass, and saves.
 - A **reader-bot** scrapes the live URL on a schedule. No login required.
 
@@ -148,7 +146,7 @@ An implementation is **drafts/0.2-conformant** if it:
 
 1. Accepts portable tokens matching the grammar of [SPEC.md §1](SPEC.md)
 2. Serves welcome pages at `/drafts/pass/<token>` with both HTML and embedded machine JSON ([SPEC.md §5](SPEC.md))
-3. Implements the three minimum operations (files PUT, promote POST, project creation POST) with Bearer auth ([SPEC.md §3](SPEC.md))
+3. Implements at minimum: project creation (`POST /drafts/projects`), upload (`POST /drafts/upload`), promote (`POST /drafts/promote`) with Bearer auth ([SPEC.md §3](SPEC.md))
 4. Publishes a registry entry matching the canonical schema ([SPEC.md §6](SPEC.md))
 5. Enforces at least the minimum per-token rate limits ([SPEC.md §4](SPEC.md))
 
