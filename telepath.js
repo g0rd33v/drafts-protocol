@@ -6,6 +6,10 @@
 //   Users send their PAP/AAP/SAP into the bot → the bot binds it
 //   to their Telegram user_id and opens the matching mini-app.
 //
+// Access policy (v0.4.1):
+//   The bot is restricted to Telegram Premium users. Non-premium users get
+//   a polite refusal. SAP-bound users always pass (server owner).
+//
 // State:  /var/lib/drafts/.telepath.json  (separate from main state.json)
 //
 // HTTP routes mounted under /telepath/* by drafts.js:
@@ -39,15 +43,14 @@ let findProjectByPAP = null;
 let findProjectAndAAPByAAPToken = null;
 let ensureProjectDirs = null;
 let listVersions = null;
-let mintPAPForExistingProject = null; // optional helper exported by drafts.js
 let serverHelpers = {};
 
 const STATE_VERSION = 1;
-const POLL_TIMEOUT  = 25;          // long-poll seconds
-const TAP_FILE      = '/etc/labs/drafts.tap'; // mode 0600, root-only
+const POLL_TIMEOUT  = 25;
+const TAP_FILE      = '/etc/labs/drafts.tap';
 
-let TAP = null;                    // { token, bot: { id, username, first_name }, installed_at, installed_by_sap_prefix }
-let telepathState = null;          // see schema in loadState()
+let TAP = null;
+let telepathState = null;
 let polling = false;
 let pollOffset = 0;
 let botMeRefreshTimer = null;
@@ -69,9 +72,7 @@ function safeWriteJSON(filepath, data) {
   fs.renameSync(tmp, filepath);
 }
 
-function statePath() {
-  return path.join(DRAFTS_DIR, '.telepath.json');
-}
+function statePath() { return path.join(DRAFTS_DIR, '.telepath.json'); }
 
 function loadState() {
   try {
@@ -84,11 +85,8 @@ function loadState() {
   if (!telepathState || telepathState.version !== STATE_VERSION) {
     telepathState = {
       version: STATE_VERSION,
-      // tg_user_id (string) → { tg_username, first_name, bindings: [{tier, token, project_name?, bound_at}], notif_subscribed: true }
       users: {},
-      // settings managed by SAP
       settings: {
-        public_pap_distribution: false, // if true: any user can /claim a fresh PAP via bot
         notify_sap_on_new_project: true,
         notify_sap_on_new_pap: true,
         notify_pap_on_aap_merge: true,
@@ -131,20 +129,16 @@ function persistTAP() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Telegram HTTP client (no deps, pure node https)
+// Telegram HTTP client
 // ─────────────────────────────────────────────────────────────
 function tgApi(method, params = {}, opts = {}) {
   if (!TAP || !TAP.token) return Promise.reject(new Error('no_tap'));
   const body = JSON.stringify(params);
   const reqOpts = {
-    hostname: 'api.telegram.org',
-    port: 443,
+    hostname: 'api.telegram.org', port: 443,
     path: `/bot${TAP.token}/${method}`,
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body),
-    },
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     timeout: opts.timeout || 30000,
   };
   return new Promise((resolve, reject) => {
@@ -172,8 +166,7 @@ function tgApi(method, params = {}, opts = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WebApp initData verification (HMAC SHA-256)
-// https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
+// WebApp initData verification
 // ─────────────────────────────────────────────────────────────
 function verifyInitData(initDataRaw) {
   if (!initDataRaw || !TAP || !TAP.token) return null;
@@ -181,16 +174,12 @@ function verifyInitData(initDataRaw) {
   const hash = params.get('hash');
   if (!hash) return null;
   params.delete('hash');
-  const dataCheckString = [...params.entries()]
-    .map(([k, v]) => `${k}=${v}`)
-    .sort()
-    .join('\n');
+  const dataCheckString = [...params.entries()].map(([k,v])=>`${k}=${v}`).sort().join('\n');
   const secret = crypto.createHmac('sha256', 'WebAppData').update(TAP.token).digest();
   const computed = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
   if (computed !== hash) return null;
-  // Reject if older than 24h
   const auth_date = Number(params.get('auth_date') || 0);
-  if (!auth_date || (Date.now() / 1000 - auth_date) > 24 * 3600) return null;
+  if (!auth_date || (Date.now()/1000 - auth_date) > 24*3600) return null;
   let user = null;
   try { user = JSON.parse(params.get('user') || 'null'); } catch (e) {}
   return { user, auth_date, query_id: params.get('query_id') };
@@ -200,16 +189,8 @@ function verifyInitData(initDataRaw) {
 // Token recognition
 // ─────────────────────────────────────────────────────────────
 function recognizeToken(text) {
-  // Returns { tier, token, project? } or null.
-  // Accepts:
-  //   raw SAP hex (12-64 hex chars)
-  //   pap_<hex> / aap_<hex>
-  //   https://<host>/drafts/pass/drafts_(server|project|agent)_<n>_<hex>
-  //   drafts_(server|project|agent)_<n>_<hex>
   if (!text) return null;
   text = String(text).trim();
-
-  // URL form
   const url = text.match(/drafts_(server|project|agent)_(\d+)_([a-f0-9]+)/i);
   if (url) {
     const tierWord = url[1].toLowerCase();
@@ -231,8 +212,6 @@ function recognizeToken(text) {
       return null;
     }
   }
-
-  // pap_/aap_ prefix
   if (/^pap_[a-f0-9]+$/i.test(text)) {
     const p = findProjectByPAP(text);
     if (p) return { tier: 'pap', token: text, project: p };
@@ -243,12 +222,9 @@ function recognizeToken(text) {
     if (hit) return { tier: 'aap', token: text, project: hit.project, aap: hit.aap };
     return null;
   }
-
-  // Raw SAP
   if (/^[a-f0-9]{12,64}$/i.test(text) && text === getSAP()) {
     return { tier: 'sap', token: text };
   }
-
   return null;
 }
 
@@ -266,14 +242,15 @@ function ensureUser(tgUser) {
       tg_user_id: tgUser.id,
       tg_username: tgUser.username || null,
       first_name: tgUser.first_name || null,
+      is_premium: !!tgUser.is_premium,
       bindings: [],
       notif_subscribed: true,
       created_at: now(),
     };
   } else {
-    // refresh display info
     telepathState.users[id].tg_username = tgUser.username || telepathState.users[id].tg_username;
     telepathState.users[id].first_name = tgUser.first_name || telepathState.users[id].first_name;
+    telepathState.users[id].is_premium = !!tgUser.is_premium;
   }
   return telepathState.users[id];
 }
@@ -281,7 +258,6 @@ function ensureUser(tgUser) {
 function bindToken(tg_user_id, recognized) {
   const user = telepathState.users[String(tg_user_id)];
   if (!user) return;
-  // remove existing binding for the same token if any
   user.bindings = user.bindings.filter(b => b.token !== recognized.token);
   user.bindings.push({
     tier: recognized.tier,
@@ -302,14 +278,6 @@ function unbindToken(tg_user_id, token) {
   return user.bindings.length < before;
 }
 
-function findUsersBoundToToken(token) {
-  const out = [];
-  for (const [id, u] of Object.entries(telepathState.users)) {
-    if (u.bindings.some(b => b.token === token)) out.push(u);
-  }
-  return out;
-}
-
 function findUsersBoundToTier(tier) {
   const out = [];
   for (const [id, u] of Object.entries(telepathState.users)) {
@@ -319,66 +287,76 @@ function findUsersBoundToTier(tier) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Premium gate
+// ─────────────────────────────────────────────────────────────
+function isAllowed(tgFrom, user) {
+  // Premium users always allowed.
+  if (tgFrom && tgFrom.is_premium) return true;
+  // SAP-bound users always allowed (server owners can be non-premium).
+  if (user && user.bindings.some(b => b.tier === 'sap')) return true;
+  return false;
+}
+
+const PREMIUM_REFUSAL =
+  '*Telegram Premium required*\n\n' +
+  'This bot is open to Telegram Premium subscribers only. ' +
+  'Upgrade to Premium in Telegram Settings to use Drafts.\n\n' +
+  '_If you are the server owner, paste your SAP token first to unlock access._';
+
+// ─────────────────────────────────────────────────────────────
 // Bot UI helpers
 // ─────────────────────────────────────────────────────────────
-function webAppUrl(suffix) {
-  return PUBLIC_BASE + '/telepath/app/' + suffix;
-}
+function webAppUrl(suffix) { return PUBLIC_BASE + '/telepath/app/' + suffix; }
 
 function tierBadge(tier) {
-  return { sap: '🔑 SAP', pap: '📁 PAP', aap: '🤝 AAP' }[tier] || tier;
+  return { sap: '🔑 server', pap: '📁 project', aap: '🤝 agent' }[tier] || tier;
 }
 
-function welcomeText(user) {
+function welcomeText(user, isPremium) {
   const name = user && user.first_name ? user.first_name : 'there';
   const host = (() => { try { return new URL(PUBLIC_BASE).hostname; } catch (e) { return 'this server'; } })();
-  let text = `*Drafts Telepath*\nHi ${esc(name)}. This bot is connected to \`${host}\`.\n\n`;
-  text += 'Send me a Drafts token or pass-link — I\'ll recognize it and open the matching dashboard right here.\n\n';
-  text += '*Token formats accepted:*\n';
-  text += '• `pap_xxxxx…` — project pass\n';
-  text += '• `aap_xxxxx…` — agent pass\n';
-  text += `• \`${PUBLIC_BASE}/drafts/pass/drafts_…\` — full pass link\n\n`;
-  if (telepathState.settings.public_pap_distribution) {
-    text += 'Or type /claim to get a fresh project of your own.\n\n';
-  }
-  text += '*Commands:* /help · /projects · /forget';
-  return text;
+  let t = `*Drafts Telepath*\nHi ${esc(name)} 👋\n\n`;
+  t += `Build a website by talking to Claude. This bot is your control center for \`${host}\`.\n\n`;
+  t += '*To get started:*\n';
+  t += '• /new — create your own project (free)\n';
+  t += '• Or paste a `pap_…` / `aap_…` token to open an existing one\n\n';
+  t += '*Other commands:* /help · /projects · /forget';
+  return t;
 }
 
 function helpText() {
-  let t = '*Telepath commands*\n\n';
-  t += '/start — welcome\n';
-  t += '/projects — list your linked projects\n';
-  t += '/forget — drop a token binding\n';
-  if (telepathState.settings.public_pap_distribution) t += '/claim — get a fresh project (open distribution is on)\n';
-  t += '/notif on|off — toggle notifications\n';
-  t += '/help — this message\n\n';
-  t += 'Send any Drafts token or pass-link to bind it.';
+  let t = '*Drafts Telepath — commands*\n\n';
+  t += '/new `[name]` — create a new project (you become its owner)\n';
+  t += '/projects — list your projects and open dashboards\n';
+  t += '/forget — remove a token binding\n';
+  t += '/notif `on|off` — toggle notifications\n';
+  t += '/start — show the welcome message\n';
+  t += '/help — show this message\n\n';
+  t += 'You can also paste any `pap_…`, `aap_…`, or `/drafts/pass/…` link directly into the chat.';
   return t;
 }
 
 function projectsListText(user) {
   if (!user || user.bindings.length === 0) {
-    return 'No bindings yet. Send me a token to get started.';
+    return 'No projects yet. Try /new to create one.';
   }
   let t = '*Your linked passes:*\n\n';
   for (const b of user.bindings) {
     t += `${tierBadge(b.tier)}`;
     if (b.project_name) t += ` · \`${esc(b.project_name)}\``;
-    t += ` · bound ${b.bound_at.slice(0,10)}\n`;
+    t += ` · ${b.bound_at.slice(0,10)}\n`;
   }
   return t;
 }
 
 function dashboardKeyboardForBinding(binding) {
-  // Returns inline_keyboard array opening WebApp for that binding
   let url, label;
   if (binding.tier === 'sap') {
     url = webAppUrl('sap');
-    label = '🔑 Open server admin';
+    label = '🔑 Server admin';
   } else if (binding.tier === 'pap') {
     url = webAppUrl('pap/' + binding.token);
-    label = '📁 Open project ' + (binding.project_name || '');
+    label = '📁 Open ' + (binding.project_name || 'project');
   } else if (binding.tier === 'aap') {
     url = webAppUrl('aap/' + binding.token);
     label = '🤝 Open agent view';
@@ -404,20 +382,29 @@ async function handleMessage(msg) {
   const text = (msg.text || '').trim();
   const user = ensureUser(msg.from);
 
+  // Premium gate — applied to ALL incoming messages except SAP token binding.
+  // We allow recognizeToken() to run first so SAP owners can activate even if non-premium.
+  const recogPreview = recognizeToken(text);
+  const isSapBindingAttempt = recogPreview && recogPreview.tier === 'sap';
+
+  if (!isAllowed(msg.from, user) && !isSapBindingAttempt) {
+    return await tgApi('sendMessage', { chat_id: chatId, text: PREMIUM_REFUSAL, parse_mode: 'Markdown', disable_web_page_preview: true });
+  }
+
   // Commands
   if (text.startsWith('/')) {
-    const [cmdRaw] = text.split(/\s+/, 1);
-    const cmd = cmdRaw.split('@')[0].toLowerCase();
-    if (cmd === '/start')    return await sendStart(chatId, user);
+    const parts = text.split(/\s+/);
+    const cmd = parts[0].split('@')[0].toLowerCase();
+    if (cmd === '/start')    return await sendStart(chatId, user, msg.from.is_premium);
     if (cmd === '/help')     return await sendHelp(chatId);
     if (cmd === '/projects') return await sendProjects(chatId, user);
     if (cmd === '/forget')   return await sendForgetMenu(chatId, user);
-    if (cmd === '/claim')    return await handleClaim(chatId, user);
+    if (cmd === '/new')      return await handleNew(chatId, user, parts.slice(1).join(' '));
     if (cmd === '/notif') {
-      const arg = text.split(/\s+/)[1];
-      if (arg === 'off') { user.notif_subscribed = false; persistState(); return await tgApi('sendMessage',{chat_id:chatId,text:'Notifications off.'}); }
-      if (arg === 'on')  { user.notif_subscribed = true;  persistState(); return await tgApi('sendMessage',{chat_id:chatId,text:'Notifications on.'}); }
-      return await tgApi('sendMessage',{chat_id:chatId,text:'Usage: /notif on|off  (currently '+(user.notif_subscribed?'on':'off')+')'});
+      const arg = parts[1];
+      if (arg === 'off') { user.notif_subscribed = false; persistState(); return await tgApi('sendMessage',{chat_id:chatId,text:'🔕 Notifications off.'}); }
+      if (arg === 'on')  { user.notif_subscribed = true;  persistState(); return await tgApi('sendMessage',{chat_id:chatId,text:'🔔 Notifications on.'}); }
+      return await tgApi('sendMessage',{chat_id:chatId,text:'Usage: `/notif on` or `/notif off`\nCurrently: '+(user.notif_subscribed?'on':'off'), parse_mode:'Markdown'});
     }
     return await tgApi('sendMessage',{chat_id:chatId,text:'Unknown command. Try /help'});
   }
@@ -427,12 +414,10 @@ async function handleMessage(msg) {
   if (recog) {
     bindToken(msg.from.id, recog);
     let body = '✅ Recognized as ' + tierBadge(recog.tier);
-    if (recog.project) body += ' for project `' + esc(recog.project.name) + '`';
-    body += '.\n\nTap the button below to open the dashboard.';
+    if (recog.project) body += ' for `' + esc(recog.project.name) + '`';
+    body += '.\n\nTap below to open the dashboard.';
     return await tgApi('sendMessage', {
-      chat_id: chatId,
-      text: body,
-      parse_mode: 'Markdown',
+      chat_id: chatId, text: body, parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: dashboardKeyboardForBinding({
         tier: recog.tier, token: recog.token, project_name: recog.project?.name,
       }) },
@@ -442,7 +427,7 @@ async function handleMessage(msg) {
   // Unrecognized text → gentle hint
   await tgApi('sendMessage', {
     chat_id: chatId,
-    text: 'I didn\'t recognize that as a Drafts token. Send me a `pap_…`, `aap_…`, or a full `/drafts/pass/…` link. Try /help for more.',
+    text: 'I didn\'t recognize that.\n\nTry /new to create a project, or paste a `pap_…` / `aap_…` token. /help for more.',
     parse_mode: 'Markdown',
   });
 }
@@ -451,6 +436,12 @@ async function handleCallback(cq) {
   const chatId = cq.message.chat.id;
   const data = cq.data || '';
   const user = ensureUser(cq.from);
+
+  // Premium gate for callbacks too
+  if (!isAllowed(cq.from, user)) {
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Premium required', show_alert: true });
+    return;
+  }
 
   if (data.startsWith('forget:')) {
     const tok = data.slice(7);
@@ -462,8 +453,8 @@ async function handleCallback(cq) {
   await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
 }
 
-async function sendStart(chatId, user) {
-  await tgApi('sendMessage', { chat_id: chatId, text: welcomeText(user), parse_mode: 'Markdown', disable_web_page_preview: true });
+async function sendStart(chatId, user, isPremium) {
+  await tgApi('sendMessage', { chat_id: chatId, text: welcomeText(user, isPremium), parse_mode: 'Markdown', disable_web_page_preview: true });
 }
 async function sendHelp(chatId) {
   await tgApi('sendMessage', { chat_id: chatId, text: helpText(), parse_mode: 'Markdown' });
@@ -487,25 +478,35 @@ async function sendForgetMenu(chatId, user) {
   await tgApi('sendMessage', { chat_id: chatId, text: 'Pick a binding to forget:', reply_markup: { inline_keyboard: kb } });
 }
 
-async function handleClaim(chatId, user) {
-  if (!telepathState.settings.public_pap_distribution) {
-    return await tgApi('sendMessage', { chat_id: chatId, text: 'Open distribution is off on this server.' });
+// /new — anyone (premium) can create a project. They become its owner (PAP).
+async function handleNew(chatId, user, requestedName) {
+  if (!serverHelpers.createProject) {
+    return await tgApi('sendMessage',{chat_id:chatId,text:'Internal error: createProject not wired'});
   }
-  // Generate a project named claim_<random> owned by claimer
-  const name = 'claim_' + crypto.randomBytes(3).toString('hex');
-  if (!serverHelpers.createProject) return await tgApi('sendMessage',{chat_id:chatId,text:'Internal error: createProject not wired'});
+  // Resolve project name. If user provided one, use it (sanitized). Else generate.
+  let name = String(requestedName || '').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,40);
+  if (!name) {
+    name = 'pad_' + crypto.randomBytes(3).toString('hex');
+  }
+  const owner = user.tg_username || user.first_name || ('user_' + user.tg_user_id);
   try {
-    const res = await serverHelpers.createProject({ name, description: 'Claimed via Telepath by ' + (user.tg_username || user.first_name || user.tg_user_id) });
-    bindToken(user.tg_user_id, { tier: 'pap', token: res.pap_token, project: { name } });
+    const res = await serverHelpers.createProject({ name, description: 'Created via Telepath by ' + owner });
+    bindToken(user.tg_user_id, { tier: 'pap', token: res.pap_token, project: { name: res.project } });
     await tgApi('sendMessage', {
       chat_id: chatId,
-      text: '🎉 Project `' + esc(name) + '` is yours.\nLive: ' + res.live_url + '\n\nTap below to open the dashboard.',
+      text: '🎉 Project `' + esc(res.project) + '` is yours.\n\n' +
+            'Live URL: ' + res.live_url + '\n\n' +
+            'Tap below to open the dashboard, then start building by talking to Claude.',
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: dashboardKeyboardForBinding({ tier: 'pap', token: res.pap_token, project_name: name }) },
+      reply_markup: { inline_keyboard: dashboardKeyboardForBinding({ tier: 'pap', token: res.pap_token, project_name: res.project }) },
     });
-    notifySAPOwners(`🆕 Claim: \`${esc(name)}\` claimed by ${esc(user.tg_username || user.first_name || user.tg_user_id)}`);
+    notifySAPOwners(`🆕 New project via /new: \`${esc(res.project)}\` by ${esc(owner)}`);
   } catch (e) {
-    await tgApi('sendMessage', { chat_id: chatId, text: 'Claim failed: ' + e.message });
+    let msg = 'Failed: ' + e.message;
+    if (e.message === 'exists') msg = 'A project with that name already exists. Try a different name: /new my-name';
+    if (e.message === 'reserved_name') msg = 'That name is reserved by the system. Try another: /new my-name';
+    if (e.message === 'invalid_name') msg = 'Invalid name. Use only lowercase letters, digits, `-`, `_` (max 40).';
+    await tgApi('sendMessage', { chat_id: chatId, text: msg, parse_mode: 'Markdown' });
   }
 }
 
@@ -519,8 +520,7 @@ async function pollLoop() {
   while (polling && TAP && TAP.token) {
     try {
       const updates = await tgApi('getUpdates', {
-        offset: pollOffset,
-        timeout: POLL_TIMEOUT,
+        offset: pollOffset, timeout: POLL_TIMEOUT,
         allowed_updates: ['message', 'callback_query'],
       }, { timeout: (POLL_TIMEOUT + 5) * 1000 });
       for (const upd of updates) {
@@ -529,7 +529,7 @@ async function pollLoop() {
       }
     } catch (e) {
       if (e.code === 401) {
-        console.error('[telepath] bot token rejected (401). Stopping polling. Re-install via TAP.');
+        console.error('[telepath] bot token rejected (401). Stopping polling.');
         polling = false;
         break;
       }
@@ -553,8 +553,34 @@ async function refreshBotMe() {
   }
 }
 
+// Configure bot commands & description in Telegram (called on TAP install)
+async function configureBotProfile() {
+  if (!TAP || !TAP.token) return;
+  const commands = [
+    { command: 'new',      description: 'Create a new project (you become the owner)' },
+    { command: 'projects', description: 'List your projects and open dashboards' },
+    { command: 'help',     description: 'Show available commands' },
+    { command: 'forget',   description: 'Remove a token binding' },
+    { command: 'notif',    description: 'Toggle notifications: /notif on or /notif off' },
+    { command: 'start',    description: 'Welcome message' },
+  ];
+  const shortDesc = 'Build websites by talking to Claude. Premium-only.';
+  const longDesc =
+    'Drafts Telepath turns Telegram into your control center for building websites with Claude. ' +
+    'Use /new to create a project, then talk to Claude through the Drafts pass-link. ' +
+    'Each version is saved automatically. Telegram Premium required.';
+  try {
+    await tgApi('setMyCommands', { commands });
+    await tgApi('setMyShortDescription', { short_description: shortDesc });
+    await tgApi('setMyDescription', { description: longDesc });
+    console.log('[telepath] bot profile configured (commands, short_description, description)');
+  } catch (e) {
+    console.error('[telepath] configureBotProfile error:', e.message);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
-// Notification dispatchers (called by drafts.js hooks)
+// Notification dispatchers
 // ─────────────────────────────────────────────────────────────
 function notifySAPOwners(text) {
   if (!TAP) return;
@@ -594,18 +620,12 @@ function onMainCommit(project, commit, versionN) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// HTTP routes for drafts.js to mount
+// HTTP routes
 // ─────────────────────────────────────────────────────────────
 function mountRoutes(app) {
-  // ──── TAP management (SAP only) ────────────────────────────
   app.get('/drafts/tap', requireSAP, (req, res) => {
     if (!TAP) return res.json({ ok: true, installed: false });
-    res.json({
-      ok: true, installed: true,
-      bot: TAP.bot || null,
-      installed_at: TAP.installed_at || null,
-      polling,
-    });
+    res.json({ ok: true, installed: true, bot: TAP.bot || null, installed_at: TAP.installed_at || null, polling });
   });
 
   app.put('/drafts/tap', requireSAP, async (req, res) => {
@@ -613,22 +633,17 @@ function mountRoutes(app) {
     if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(token)) {
       return res.status(400).json({ ok: false, error: 'invalid_token_format' });
     }
-    // Try getMe with this token
     const probe = { token };
     const oldTAP = TAP;
     TAP = probe;
     try {
       const me = await tgApi('getMe');
-      TAP = {
-        token,
-        bot: { id: me.id, username: me.username, first_name: me.first_name },
-        installed_at: now(),
-      };
+      TAP = { token, bot: { id: me.id, username: me.username, first_name: me.first_name }, installed_at: now() };
       persistTAP();
-      // (Re)start polling
       stopPolling();
       await sleep(500);
       pollLoop();
+      configureBotProfile().catch(()=>{});
       res.json({ ok: true, bot: TAP.bot });
     } catch (e) {
       TAP = oldTAP;
@@ -644,18 +659,24 @@ function mountRoutes(app) {
   });
 
   app.put('/drafts/tap/settings', requireSAP, (req, res) => {
-    const allowed = ['public_pap_distribution','notify_sap_on_new_project','notify_sap_on_new_pap','notify_pap_on_aap_merge','notify_pap_on_main_commit'];
+    const allowed = ['notify_sap_on_new_project','notify_sap_on_new_pap','notify_pap_on_aap_merge','notify_pap_on_main_commit'];
     for (const k of allowed) if (k in req.body) telepathState.settings[k] = !!req.body[k];
     persistState();
     res.json({ ok: true, settings: telepathState.settings });
   });
 
-  // ──── WebApp pages (initData-authed) ───────────────────────
+  // Re-run setMyCommands etc. on demand (useful after editing the list)
+  app.post('/drafts/tap/configure', requireSAP, async (req, res) => {
+    try { await configureBotProfile(); res.json({ ok: true }); }
+    catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // WebApp pages
   app.get('/telepath/app/sap',           (req, res) => res.type('html').send(renderWebAppShell('sap')));
   app.get('/telepath/app/pap/:token',    (req, res) => res.type('html').send(renderWebAppShell('pap', req.params.token)));
   app.get('/telepath/app/aap/:token',    (req, res) => res.type('html').send(renderWebAppShell('aap', req.params.token)));
 
-  // ──── WebApp API (initData required) ───────────────────────
+  // WebApp API
   app.post('/telepath/api/whoami', initDataAuth, (req, res) => {
     res.json({ ok: true, tg_user: req.tgUser });
   });
@@ -664,7 +685,6 @@ function mountRoutes(app) {
     const tier = req.params.tier;
     const token = req.params.token;
     if (tier === 'sap') {
-      // verify the user actually has SAP binding (defense in depth)
       const u = getUser(req.tgUser.id);
       if (!u || !u.bindings.some(b => b.tier === 'sap')) return res.status(403).json({ ok: false, error: 'no_sap_binding' });
       const projects = getDraftsState().projects.map(p => ({
@@ -683,6 +703,7 @@ function mountRoutes(app) {
       return res.json({ ok: true, tier: 'pap', public_base: PUBLIC_BASE, project: {
         name: p.name, description: p.description, github_repo: p.github_repo,
         created_at: p.created_at, live_url: PUBLIC_BASE + '/' + p.name + '/',
+        pass_url: PUBLIC_BASE + '/drafts/pass/drafts_project_' + SERVER_NUMBER + '_' + token.replace(/^pap_/,''),
         aaps: (p.aaps || []).map(a => ({ id: a.id, name: a.name, revoked: a.revoked, branch: a.branch })),
       }});
     }
@@ -694,6 +715,7 @@ function mountRoutes(app) {
       return res.json({ ok: true, tier: 'aap', public_base: PUBLIC_BASE,
         project: { name: hit.project.name, live_url: PUBLIC_BASE + '/' + hit.project.name + '/' },
         aap: { id: hit.aap.id, name: hit.aap.name, branch: hit.aap.branch },
+        pass_url: PUBLIC_BASE + '/drafts/pass/drafts_agent_' + SERVER_NUMBER + '_' + token.replace(/^aap_/,''),
       });
     }
     return res.status(400).json({ ok: false, error: 'bad_tier' });
@@ -757,7 +779,7 @@ function initDataAuth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WebApp shell HTML — minimal, mobile-first, dark, Telegram theme aware
+// WebApp shell HTML
 // ─────────────────────────────────────────────────────────────
 function renderWebAppShell(tier, token) {
   const stateUrl = '/telepath/api/state/' + tier + (token ? '/' + token : '');
@@ -845,33 +867,26 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
       h += '<div class="proj-meta">'+(p.description ? esc(p.description)+' · ' : '')+'AAPs: '+p.aap_count+' · '+(p.pap_active?'PAP active':'PAP revoked')+'</div></div>';
     }
     h += '</div>';
-    h += '<div class="card"><h3>Settings</h3>';
-    h += '<label style="display:flex;align-items:center;gap:8px;padding:8px 0;"><input type="checkbox" id="ppd" '+(d.settings.public_pap_distribution?'checked':'')+'/> Public PAP distribution (/claim)</label>';
-    h += '</div>';
     root.innerHTML = h;
     document.getElementById('createBtn').addEventListener('click', async () => {
       const name = document.getElementById('newName').value.trim();
       const description = document.getElementById('newDesc').value.trim();
       if (!name) { toast('Name required'); return; }
       try {
-        const out = await api('POST', '/telepath/api/sap/projects', { name, description });
-        toast('Created · binding added');
+        await api('POST', '/telepath/api/sap/projects', { name, description });
+        toast('Created');
         setTimeout(load, 600);
       } catch (e) { toast('Failed: '+e.message); }
-    });
-    document.getElementById('ppd').addEventListener('change', async (ev) => {
-      try { await api('PUT', '/drafts/tap/settings', {}); } catch (e) {}
-      // Note: this endpoint requires SAP bearer, not initData — TODO unify; for now toggle is read-only display
-      toast('Toggle PAP distribution via SAP page on website');
-      ev.target.checked = d.settings.public_pap_distribution;
     });
   }
 
   function renderPAP(d) {
     const p = d.project;
     let h = '<h1>'+esc(p.name)+'</h1><div class="sub">Project · '+esc(d.public_base.replace(/^https?:\\/\\//,''))+'</div>';
-    h += '<div class="card"><h3>Live</h3>';
-    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">Open '+esc(p.live_url.replace(/^https?:\\/\\//,''))+' ↗</a>';
+    h += '<div class="card"><h3>Build</h3>';
+    h += '<div class="muted" style="margin-bottom:10px">Open the pass-link in Claude (Chrome extension or claude.ai) to start building.</div>';
+    h += '<button class="btn" id="copyPass">Copy pass-link</button>';
+    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">Open live ↗</a>';
     h += '</div>';
     h += '<div class="card"><h3>Agents (AAP)</h3>';
     if (!p.aaps.length) h += '<div class="empty muted">No agents yet</div>';
@@ -880,7 +895,7 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
       h += '<div class="proj-meta">branch: '+esc(a.branch)+'</div></div>';
     }
     h += '<div style="margin-top:12px"><input id="aapName" placeholder="agent name (optional)" maxlength="60"/>';
-    h += '<button class="btn" id="newAap">Generate AAP link</button></div>';
+    h += '<button class="btn" id="newAap">Generate agent link</button></div>';
     h += '</div>';
     h += '<div class="card"><h3>Project info</h3>';
     h += '<div class="row"><span class="k">created</span><span class="v">'+esc(p.created_at.slice(0,10))+'</span></div>';
@@ -888,13 +903,13 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
     h += '<div class="row"><span class="k">description</span><span class="v">'+esc(p.description||'—')+'</span></div>';
     h += '</div>';
     root.innerHTML = h;
+    document.getElementById('copyPass').addEventListener('click', () => copy(p.pass_url));
     document.getElementById('newAap').addEventListener('click', async () => {
       const name = document.getElementById('aapName').value.trim();
       try {
         const out = await api('POST', '/telepath/api/pap/aaps', { pap_token: TOKEN, name });
-        const url = out.activation_url;
-        copy(url);
-        toast('Link copied — share it with the agent');
+        copy(out.activation_url);
+        toast('Agent link copied');
         setTimeout(load, 600);
       } catch (e) { toast('Failed: '+e.message); }
     });
@@ -903,12 +918,13 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
   function renderAAP(d) {
     const p = d.project;
     let h = '<h1>'+esc(p.name)+'</h1><div class="sub">Agent: '+esc(d.aap.name||d.aap.id)+'</div>';
-    h += '<div class="card"><h3>Branch</h3>';
-    h += '<div class="row"><span class="k">name</span><span class="v">'+esc(d.aap.branch)+'</span></div>';
-    h += '<div class="row"><span class="k">project live</span><span class="v"><a href="'+p.live_url+'" target="_blank" style="color:#60a5fa">'+esc(p.live_url.replace(/^https?:\\/\\//,''))+'</a></span></div>';
+    h += '<div class="card"><h3>Build in your branch</h3>';
+    h += '<div class="muted" style="margin-bottom:10px">Open this pass-link in Claude to start contributing. Your work goes to '+esc(d.aap.branch)+'.</div>';
+    h += '<button class="btn" id="copyPass">Copy pass-link</button>';
+    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">View live ↗</a>';
     h += '</div>';
-    h += '<div class="card"><h3>Working with this branch</h3><div class="muted">For now, use Claude in Chrome to edit files in your branch. The bot will notify the project owner when you commit.</div></div>';
     root.innerHTML = h;
+    document.getElementById('copyPass').addEventListener('click', () => copy(d.pass_url));
   }
 
   load();
@@ -918,7 +934,7 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
 }
 
 // ─────────────────────────────────────────────────────────────
-// init() — called by drafts.js at startup
+// init()
 // ─────────────────────────────────────────────────────────────
 export function initTelepath(opts) {
   DRAFTS_DIR = opts.draftsDir;
@@ -937,9 +953,12 @@ export function initTelepath(opts) {
   loadState();
   loadTAP();
   if (TAP && TAP.token) {
-    refreshBotMe().then(() => pollLoop());
+    refreshBotMe().then(() => {
+      configureBotProfile().catch(()=>{}); // refresh commands on startup
+      pollLoop();
+    });
     if (botMeRefreshTimer) clearInterval(botMeRefreshTimer);
-    botMeRefreshTimer = setInterval(refreshBotMe, 6 * 3600 * 1000); // every 6h
+    botMeRefreshTimer = setInterval(refreshBotMe, 6 * 3600 * 1000);
   } else {
     console.log('[telepath] no TAP installed — bot inactive. Install via PUT /drafts/tap');
   }
@@ -947,7 +966,6 @@ export function initTelepath(opts) {
 
 export function mountTelepathRoutes(app) { mountRoutes(app); }
 
-// Hooks (called by drafts.js when events happen)
 export const hooks = {
   onNewProject,
   onNewAAPCreated,
