@@ -1,7 +1,7 @@
-// project-bots.js — Per-project Telegram bots manager (v0.6 — webhook forwarder).
+// project-bots.js — Per-project Telegram bots manager (v0.7 — webhook forwarder + analytics).
 //
 // Each Drafts project (PAP) can have an attached Telegram bot. The bot acts
-// as a public mini-app shell + a webhook forwarder.
+// as a public mini-app shell + a webhook forwarder + auto analytics recorder.
 //
 // Two modes per project bot:
 //
@@ -16,18 +16,15 @@
 //      /stop unsubscribes, anything else gets a polite nudge. The owner
 //      can broadcast updates via the WebApp dashboard.
 //
-// Per-bot state in project.bot:
-//   token, bot_id, bot_username, bot_name, installed_at, last_synced_at,
-//   subscribers, webhook_url, webhook_log
-//
-// webhook_log = ring buffer of last N calls:
-//   [{ at: ISO, update_id, status, latency_ms, error?: string }]
+// In BOTH modes, every update is recorded by analytics.js (privacy-respecting
+// metadata only — never raw message text). Owner can view + export from WebApp.
 
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import http from 'http';
 import { URL as NodeURL } from 'url';
+import { recordUpdate } from './analytics.js';
 
 // ─────────────────────────────────────────────────────────────
 // Config (set by init from drafts.js)
@@ -38,12 +35,11 @@ let saveDraftsState = null;
 let findProjectByName = null;
 
 const POLL_TIMEOUT = 25;
-const SEND_THROTTLE_MS = 50; // ~20/sec, well under Telegram's 30/sec global limit
+const SEND_THROTTLE_MS = 50;
 const WEBHOOK_TIMEOUT_MS = 5000;
 const WEBHOOK_RETRY_DELAY_MS = 2000;
 const WEBHOOK_LOG_MAX = 20;
 
-// pollers: project.name → { polling: bool, offset: number, abort?: bool }
 const pollers = new Map();
 
 // ─────────────────────────────────────────────────────────────
@@ -92,7 +88,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const now = () => new Date().toISOString();
 
 // ─────────────────────────────────────────────────────────────
-// Webhook URL validation
+// Webhook URL validation (SSRF-safe)
 // ─────────────────────────────────────────────────────────────
 function validateWebhookUrl(raw) {
   if (!raw || typeof raw !== 'string') return { ok: false, error: 'empty' };
@@ -102,7 +98,6 @@ function validateWebhookUrl(raw) {
   if (u.protocol !== 'https:' && u.protocol !== 'http:') {
     return { ok: false, error: 'must_be_http_or_https' };
   }
-  // Block private/loopback addresses to prevent SSRF abuse
   const host = u.hostname.toLowerCase();
   if (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0' || host === '::1') {
     return { ok: false, error: 'localhost_not_allowed' };
@@ -112,7 +107,6 @@ function validateWebhookUrl(raw) {
   }
   if (/^169\.254\./.test(host)) return { ok: false, error: 'link_local_not_allowed' };
   if (host.endsWith('.internal') || host.endsWith('.local')) return { ok: false, error: 'internal_tld_not_allowed' };
-  // Block our own host so users don't accidentally loop back
   try {
     const ourHost = new NodeURL(PUBLIC_BASE).hostname.toLowerCase();
     if (host === ourHost) return { ok: false, error: 'cannot_target_drafts_itself' };
@@ -121,7 +115,7 @@ function validateWebhookUrl(raw) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Webhook forwarder — POSTs a Telegram update to user's URL
+// Webhook forwarder
 // ─────────────────────────────────────────────────────────────
 function forwardToWebhook(webhookUrl, update, headers = {}) {
   return new Promise((resolve) => {
@@ -140,13 +134,12 @@ function forwardToWebhook(webhookUrl, update, headers = {}) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
-        'User-Agent': 'Drafts-Webhook-Forwarder/0.6',
+        'User-Agent': 'Drafts-Webhook-Forwarder/0.7',
         ...headers,
       },
       timeout: WEBHOOK_TIMEOUT_MS,
     };
     const req = lib.request(reqOpts, (res) => {
-      // Drain the body but cap it (we don't actually use it; user replies via Telegram API directly)
       let bytes = 0;
       res.on('data', (chunk) => { bytes += chunk.length; if (bytes > 65536) res.destroy(); });
       res.on('end', () => finish({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode }));
@@ -197,7 +190,7 @@ function readMeta(projectName) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Subscribers (only used in default mode, when no webhook_url)
+// Subscribers (default mode)
 // ─────────────────────────────────────────────────────────────
 function addSubscriber(project, tgUserId) {
   if (!project.bot) return;
@@ -215,7 +208,7 @@ function removeSubscriber(project, tgUserId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Default mode handler (no webhook_url) — minimal /start, /stop
+// Default mode handler — minimal /start, /stop
 // ─────────────────────────────────────────────────────────────
 async function handleDefaultModeUpdate(project, upd) {
   try {
@@ -248,7 +241,6 @@ async function handleDefaultModeUpdate(project, upd) {
       }).catch(()=>{});
       return;
     }
-    // Default: gentle nudge
     await tgApi(token, 'sendMessage', {
       chat_id: chatId,
       text: 'Hi 👋 Open the menu button to use this app, or send /start to subscribe to updates.',
@@ -269,7 +261,6 @@ async function handleWebhookModeUpdate(project, upd) {
     'X-Drafts-Bot-Username': '@' + (project.bot.bot_username || ''),
   };
   let result = await forwardToWebhook(url, upd, headers);
-  // Retry once on failure
   if (!result.ok) {
     await sleep(WEBHOOK_RETRY_DELAY_MS);
     result = await forwardToWebhook(url, upd, headers);
@@ -284,9 +275,19 @@ async function handleWebhookModeUpdate(project, upd) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Update dispatcher — picks mode based on webhook_url presence
+// Update dispatcher — analytics FIRST, then mode-specific handler
 // ─────────────────────────────────────────────────────────────
 async function dispatchUpdate(project, upd) {
+  // Always record analytics first (synchronous, fast — file append)
+  // Wrapped in try/catch in analytics.js itself; this should never throw
+  try {
+    if (project.bot?.analytics_enabled !== false) {
+      recordUpdate(project.name, process.env.DRAFTS_DIR || '/var/lib/drafts', upd);
+    }
+  } catch (e) {
+    console.error('[project-bot:' + project.name + '] analytics error:', e.message);
+  }
+
   if (project.bot?.webhook_url) {
     await handleWebhookModeUpdate(project, upd);
   } else {
@@ -309,18 +310,15 @@ async function pollProjectBot(projectName) {
       break;
     }
     try {
-      // In webhook mode, request all update types so user gets the full picture.
-      // In default mode, only message (we only handle /start, /stop).
-      const allowed = project.bot.webhook_url
-        ? ['message', 'edited_message', 'channel_post', 'edited_channel_post', 'callback_query', 'inline_query', 'chosen_inline_result', 'shipping_query', 'pre_checkout_query', 'poll', 'poll_answer', 'my_chat_member', 'chat_member', 'chat_join_request']
-        : ['message'];
+      // Subscribe to ALL update types regardless of mode — analytics needs the full picture.
+      const allowed = ['message', 'edited_message', 'channel_post', 'edited_channel_post', 'callback_query', 'inline_query', 'chosen_inline_result', 'shipping_query', 'pre_checkout_query', 'poll', 'poll_answer', 'my_chat_member', 'chat_member', 'chat_join_request'];
       const updates = await tgApi(project.bot.token, 'getUpdates', {
         offset: ctx.offset, timeout: POLL_TIMEOUT,
         allowed_updates: allowed,
       }, { timeout: (POLL_TIMEOUT + 5) * 1000 });
       for (const upd of updates) {
         ctx.offset = Math.max(ctx.offset, upd.update_id + 1);
-        // Don't await — fire-and-forget so slow webhook doesn't block polling
+        // Fire-and-forget so slow webhook doesn't block polling
         dispatchUpdate(project, upd).catch(e =>
           console.error('[project-bot:' + projectName + '] dispatch error:', e.message)
         );
@@ -348,7 +346,6 @@ function stopPolling(projectName) {
 }
 
 function restartPolling(projectName) {
-  // Stop existing, wait briefly, restart with fresh context
   stopPolling(projectName);
   setTimeout(() => {
     const project = findProjectByName(projectName);
@@ -359,7 +356,7 @@ function restartPolling(projectName) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Profile sync (apply project metadata + chat menu button to the bot)
+// Profile sync
 // ─────────────────────────────────────────────────────────────
 async function applyBotProfile(project) {
   const token = project.bot?.token;
@@ -388,8 +385,6 @@ async function applyBotProfile(project) {
     console.warn('[project-bot:' + project.name + '] setChatMenuButton failed:', e.message);
   }
 
-  // In webhook mode, leave commands empty — user's webhook handler manages them.
-  // In default mode, set our minimal commands.
   if (!project.bot.webhook_url) {
     try {
       await tgApi(token, 'setMyCommands', {
@@ -402,7 +397,6 @@ async function applyBotProfile(project) {
       console.warn('[project-bot:' + project.name + '] setMyCommands failed:', e.message);
     }
   } else {
-    // Clear commands in webhook mode so user can set their own via setMyCommands from their handler
     try { await tgApi(token, 'setMyCommands', { commands: [] }); } catch (e) {}
   }
 
@@ -414,7 +408,7 @@ async function applyBotProfile(project) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Broadcast to subscribers (default mode only)
+// Broadcast (default mode only)
 // ─────────────────────────────────────────────────────────────
 async function broadcast(project, html) {
   const token = project.bot?.token;
@@ -441,7 +435,7 @@ async function broadcast(project, html) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Public API: install / unlink / sync / status / setWebhookUrl
+// Public API
 // ─────────────────────────────────────────────────────────────
 async function installBot(project, botToken, opts = {}) {
   if (project.bot && project.bot.token) {
@@ -459,7 +453,6 @@ async function installBot(project, botToken, opts = {}) {
       throw new Error('bot_already_used_by_another_project');
     }
   }
-  // Validate webhook URL if provided at install time
   let validatedWebhook = null;
   if (opts.webhook_url) {
     const v = validateWebhookUrl(opts.webhook_url);
@@ -476,6 +469,7 @@ async function installBot(project, botToken, opts = {}) {
     subscribers: [],
     webhook_url: validatedWebhook,
     webhook_log: [],
+    analytics_enabled: true,
   };
   saveDraftsState();
   try { await applyBotProfile(project); } catch (e) { console.warn('initial sync failed:', e.message); }
@@ -511,7 +505,6 @@ async function syncBot(project, broadcastMessageHtml) {
   if (!project.bot || !project.bot.token) throw new Error('no_bot');
   const result = await applyBotProfile(project);
   let broadcastResult = { sent: 0, failed: 0, skipped: true };
-  // Broadcast only works in default mode (webhook mode users have their own users via webhook)
   if (broadcastMessageHtml && broadcastMessageHtml.trim() && !project.bot.webhook_url) {
     broadcastResult = await broadcast(project, broadcastMessageHtml);
     broadcastResult.skipped = false;
@@ -519,14 +512,12 @@ async function syncBot(project, broadcastMessageHtml) {
   return { meta: result.meta, live_url: result.liveUrl, broadcast: broadcastResult };
 }
 
-// Set/clear/change webhook URL without re-installing the bot
 async function setWebhookUrl(project, urlOrNull) {
   if (!project.bot || !project.bot.token) throw new Error('no_bot');
   if (urlOrNull == null || urlOrNull === '' || urlOrNull === false) {
     project.bot.webhook_url = null;
     project.bot.webhook_log = [];
     saveDraftsState();
-    // Re-apply profile so commands/menu reflect default-mode posture
     try { await applyBotProfile(project); } catch (e) {}
     restartPolling(project.name);
     return { webhook_url: null };
@@ -539,6 +530,13 @@ async function setWebhookUrl(project, urlOrNull) {
   try { await applyBotProfile(project); } catch (e) {}
   restartPolling(project.name);
   return { webhook_url: v.url };
+}
+
+function setAnalyticsEnabled(project, enabled) {
+  if (!project.bot || !project.bot.token) throw new Error('no_bot');
+  project.bot.analytics_enabled = !!enabled;
+  saveDraftsState();
+  return { analytics_enabled: project.bot.analytics_enabled };
 }
 
 function getBotStatus(project) {
@@ -556,11 +554,12 @@ function getBotStatus(project) {
     webhook_url: project.bot.webhook_url || null,
     webhook_log: (project.bot.webhook_log || []).slice(0, WEBHOOK_LOG_MAX),
     mode: project.bot.webhook_url ? 'webhook' : 'default',
+    analytics_enabled: project.bot.analytics_enabled !== false,
   };
 }
 
 // ─────────────────────────────────────────────────────────────
-// init — restart all pollers from state on drafts.js startup
+// init
 // ─────────────────────────────────────────────────────────────
 export function initProjectBots(opts) {
   PUBLIC_BASE = opts.publicBase;
@@ -570,12 +569,19 @@ export function initProjectBots(opts) {
 
   const state = getDraftsState();
   let started = 0;
+  // Schema migration: ensure analytics_enabled defaults to true on existing bots
+  let migrated = 0;
   for (const project of state.projects) {
     if (project.bot && project.bot.token) {
+      if (!('analytics_enabled' in project.bot)) {
+        project.bot.analytics_enabled = true;
+        migrated++;
+      }
       pollProjectBot(project.name);
       started++;
     }
   }
+  if (migrated) { saveDraftsState(); console.log(`[project-bots] migrated ${migrated} bot(s) → analytics_enabled=true`); }
   console.log('[project-bots] init complete — ' + started + ' bot poller(s) started');
 }
 
@@ -584,6 +590,7 @@ export const projectBotsApi = {
   unlinkBot,
   syncBot,
   setWebhookUrl,
+  setAnalyticsEnabled,
   getBotStatus,
   broadcast,
   applyBotProfile,
