@@ -10,12 +10,17 @@
 //   The bot is restricted to Telegram Premium users. Non-premium users get
 //   a polite refusal. SAP-bound users always pass (server owner).
 //
+// /new flow (v0.4.3):
+//   1. /new (no args) → bot asks for a name, shows URL preview format
+//   2. user types a name → bot validates, shows the exact URL preview + Confirm/Cancel buttons
+//   3. /new <name> → same as above, but skips step 1
+//   4. user taps Confirm → project is created, dashboard button appears
+//
 // Formatting:
 //   All bot messages use parse_mode: 'HTML'. Underscores in URLs/identifiers
-//   would break Markdown parsing (Telegram interprets _ as italic), so HTML
-//   is safer and only requires escaping &, <, >, " in user-supplied text.
+//   would break Markdown parsing.
 //
-// State:  /var/lib/drafts/.telepath.json  (separate from main state.json)
+// State:  /var/lib/drafts/.telepath.json
 
 import fs from 'fs';
 import fsp from 'fs/promises';
@@ -42,6 +47,7 @@ let serverHelpers = {};
 const STATE_VERSION = 1;
 const POLL_TIMEOUT  = 25;
 const TAP_FILE      = '/etc/labs/drafts.tap';
+const PENDING_TTL_MS = 10 * 60 * 1000; // 10 min — pending name request expires
 
 let TAP = null;
 let telepathState = null;
@@ -49,13 +55,17 @@ let polling = false;
 let pollOffset = 0;
 let botMeRefreshTimer = null;
 
+// pending_create — short-lived, in-memory map of pending project-create flows.
+// Key: tg_user_id, value: { name, expires_at, message_id_to_edit }
+// Stored separately from persistent telepathState so restarts simply cancel pending flows.
+const pendingCreate = new Map();
+
 // ─────────────────────────────────────────────────────────────
 // Utility
 // ─────────────────────────────────────────────────────────────
 const now = () => new Date().toISOString();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// HTML escape — required for any user-supplied text inserted into HTML-mode bot messages
 function esc(s) {
   if (s == null) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -160,14 +170,10 @@ function tgApi(method, params = {}, opts = {}) {
   });
 }
 
-// Convenience: send message in HTML mode with safe defaults
 function tgSend(chatId, html, opts = {}) {
   return tgApi('sendMessage', {
-    chat_id: chatId,
-    text: html,
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...opts,
+    chat_id: chatId, text: html, parse_mode: 'HTML',
+    disable_web_page_preview: true, ...opts,
   });
 }
 
@@ -308,19 +314,20 @@ const PREMIUM_REFUSAL =
   '<i>If you are the server owner, paste your SAP token first to unlock access.</i>';
 
 // ─────────────────────────────────────────────────────────────
-// Bot UI helpers
+// Helpers
 // ─────────────────────────────────────────────────────────────
 function webAppUrl(suffix) { return PUBLIC_BASE + '/telepath/app/' + suffix; }
-
+function publicHostname() {
+  try { return new URL(PUBLIC_BASE).hostname; } catch (e) { return 'this server'; }
+}
 function tierBadge(tier) {
   return { sap: '🔑 server', pap: '📁 project', aap: '🤝 agent' }[tier] || tier;
 }
 
 function welcomeText(user) {
   const name = user && user.first_name ? user.first_name : 'there';
-  const host = (() => { try { return new URL(PUBLIC_BASE).hostname; } catch (e) { return 'this server'; } })();
   let t = `<b>Drafts Telepath</b>\nHi ${esc(name)} 👋\n\n`;
-  t += `Build a website by talking to Claude. This bot is your control center for <code>${esc(host)}</code>.\n\n`;
+  t += `Build a website by talking to Claude. This bot is your control center for <code>${esc(publicHostname())}</code>.\n\n`;
   t += '<b>To get started:</b>\n';
   t += '• /new — create your own project (free)\n';
   t += '• Or paste a <code>pap_…</code> / <code>aap_…</code> token to open an existing one\n\n';
@@ -330,7 +337,7 @@ function welcomeText(user) {
 
 function helpText() {
   let t = '<b>Drafts Telepath — commands</b>\n\n';
-  t += '/new <code>[name]</code> — create a new project (you become its owner)\n';
+  t += '/new — create a new project (you become its owner)\n';
   t += '/projects — list your projects and open dashboards\n';
   t += '/forget — remove a token binding\n';
   t += '/notif <code>on|off</code> — toggle notifications\n';
@@ -369,6 +376,90 @@ function dashboardKeyboardForBinding(binding) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// /new flow — interactive wizard
+// ─────────────────────────────────────────────────────────────
+
+// Validate a project name string. Returns { ok: true, name } or { ok: false, error }.
+function validateProjectName(raw) {
+  const name = String(raw || '').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,40);
+  if (!name) return { ok: false, error: 'empty' };
+  if (name.length < 2) return { ok: false, error: 'too_short' };
+  if (/^[-_]/.test(name) || /[-_]$/.test(name)) return { ok: false, error: 'edge_separators' };
+  // Reserved-name check happens server-side in createProject
+  return { ok: true, name };
+}
+
+function previewUrl(name) { return PUBLIC_BASE + '/' + name + '/'; }
+
+// Send "what name?" prompt — entry point for /new with no args
+async function sendNewPrompt(chatId) {
+  const exampleHost = publicHostname();
+  const html =
+    '<b>Create a new project</b>\n\n' +
+    'What do you want to call it? Send the name as your next message.\n\n' +
+    `Your project will live at:\n<code>https://${esc(exampleHost)}/&lt;your-name&gt;/</code>\n\n` +
+    '<i>Allowed: lowercase letters, digits, <code>-</code>, <code>_</code>. 2–40 characters.</i>';
+  await tgSend(chatId, html, {
+    reply_markup: { inline_keyboard: [[{ text: '✕ Cancel', callback_data: 'new:cancel' }]] },
+  });
+}
+
+// Show preview + Confirm/Edit/Cancel — entry point for both /new <name> and post-name input
+async function sendNewPreview(chatId, name) {
+  const url = previewUrl(name);
+  const html =
+    '<b>Ready to create</b>\n\n' +
+    `Name: <code>${esc(name)}</code>\n` +
+    `URL: <a href="${esc(url)}">${esc(url)}</a>\n\n` +
+    'Looks good?';
+  await tgSend(chatId, html, {
+    reply_markup: { inline_keyboard: [
+      [{ text: '✓ Create', callback_data: 'new:confirm:' + name }],
+      [{ text: '✎ Change name', callback_data: 'new:rename' }, { text: '✕ Cancel', callback_data: 'new:cancel' }],
+    ]},
+  });
+}
+
+// Set pending state for this user — they're expected to send a name as next message
+function setPending(tgUserId) {
+  pendingCreate.set(tgUserId, { expires_at: Date.now() + PENDING_TTL_MS });
+}
+function clearPending(tgUserId) { pendingCreate.delete(tgUserId); }
+function getPending(tgUserId) {
+  const p = pendingCreate.get(tgUserId);
+  if (!p) return null;
+  if (Date.now() > p.expires_at) { pendingCreate.delete(tgUserId); return null; }
+  return p;
+}
+
+// Actually create the project (called from confirm button)
+async function actuallyCreateProject(chatId, user, name) {
+  if (!serverHelpers.createProject) {
+    return await tgSend(chatId, 'Internal error: createProject not wired');
+  }
+  const owner = user.tg_username || user.first_name || ('user_' + user.tg_user_id);
+  try {
+    const res = await serverHelpers.createProject({ name, description: 'Created via Telepath by ' + owner });
+    bindToken(user.tg_user_id, { tier: 'pap', token: res.pap_token, project: { name: res.project } });
+    const html =
+      '🎉 <b>Project created</b>\n\n' +
+      `Name: <code>${esc(res.project)}</code>\n` +
+      `Live URL: <a href="${esc(res.live_url)}">${esc(res.live_url)}</a>\n\n` +
+      'Tap below to open the dashboard, then start building by talking to Claude.';
+    await tgSend(chatId, html, {
+      reply_markup: { inline_keyboard: dashboardKeyboardForBinding({ tier: 'pap', token: res.pap_token, project_name: res.project }) },
+    });
+    notifySAPOwners(`🆕 New project via /new: <code>${esc(res.project)}</code> by ${esc(owner)}`);
+  } catch (e) {
+    let msg = 'Failed: ' + esc(e.message);
+    if (e.message === 'exists') msg = `A project named <code>${esc(name)}</code> already exists. Try a different name with /new.`;
+    if (e.message === 'reserved_name') msg = `<code>${esc(name)}</code> is reserved by the system. Try another name with /new.`;
+    if (e.message === 'invalid_name') msg = 'Invalid name. Use only lowercase letters, digits, <code>-</code>, <code>_</code> (2–40 chars).';
+    await tgSend(chatId, msg);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // Update handler
 // ─────────────────────────────────────────────────────────────
 async function handleUpdate(upd) {
@@ -398,11 +489,18 @@ async function handleMessage(msg) {
   if (text.startsWith('/')) {
     const parts = text.split(/\s+/);
     const cmd = parts[0].split('@')[0].toLowerCase();
+    // If user was in /new wizard but issues another command, cancel the wizard silently.
+    if (cmd !== '/new') clearPending(msg.from.id);
+
     if (cmd === '/start')    return await sendStart(chatId, user);
     if (cmd === '/help')     return await sendHelp(chatId);
     if (cmd === '/projects') return await sendProjects(chatId, user);
     if (cmd === '/forget')   return await sendForgetMenu(chatId, user);
-    if (cmd === '/new')      return await handleNew(chatId, user, parts.slice(1).join(' '));
+    if (cmd === '/new')      return await handleNewCommand(chatId, user, parts.slice(1).join(' '));
+    if (cmd === '/cancel') {
+      if (getPending(msg.from.id)) { clearPending(msg.from.id); return await tgSend(chatId, 'Cancelled.'); }
+      return await tgSend(chatId, 'Nothing to cancel.');
+    }
     if (cmd === '/notif') {
       const arg = parts[1];
       if (arg === 'off') { user.notif_subscribed = false; persistState(); return await tgSend(chatId, '🔕 Notifications off.'); }
@@ -412,9 +510,10 @@ async function handleMessage(msg) {
     return await tgSend(chatId, 'Unknown command. Try /help');
   }
 
-  // Token recognition
+  // Token recognition takes precedence over pending /new (you might paste a token mid-flow)
   const recog = recognizeToken(text);
   if (recog) {
+    clearPending(msg.from.id);
     bindToken(msg.from.id, recog);
     let body = '✅ Recognized as ' + tierBadge(recog.tier);
     if (recog.project) body += ' for <code>' + esc(recog.project.name) + '</code>';
@@ -426,10 +525,56 @@ async function handleMessage(msg) {
     });
   }
 
+  // If user is in /new wizard, treat this message as the project name input
+  if (getPending(msg.from.id)) {
+    const v = validateProjectName(text);
+    if (!v.ok) {
+      const explain = v.error === 'empty' ? 'Name is empty.'
+        : v.error === 'too_short' ? 'Name is too short (min 2 chars).'
+        : v.error === 'edge_separators' ? 'Name can\'t start or end with <code>-</code> or <code>_</code>.'
+        : 'Invalid name.';
+      return await tgSend(chatId,
+        explain + ' Try again, or /cancel.\n\n<i>Allowed: a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.</i>'
+      );
+    }
+    // Check uniqueness now to fail fast
+    if (findProjectByName(v.name)) {
+      return await tgSend(chatId,
+        `A project named <code>${esc(v.name)}</code> already exists. Try another, or /cancel.`
+      );
+    }
+    // Valid + unique → show preview with Confirm
+    clearPending(msg.from.id); // pending is consumed; user re-engages via buttons
+    return await sendNewPreview(chatId, v.name);
+  }
+
   // Unrecognized text → gentle hint
   await tgSend(chatId,
     'I didn\'t recognize that.\n\nTry /new to create a project, or paste a <code>pap_…</code> / <code>aap_…</code> token. /help for more.'
   );
+}
+
+// /new entry point: with or without name argument
+async function handleNewCommand(chatId, user, requestedName) {
+  if (requestedName && requestedName.trim()) {
+    const v = validateProjectName(requestedName);
+    if (!v.ok) {
+      const explain = v.error === 'too_short' ? 'That name is too short (min 2 chars).'
+        : v.error === 'edge_separators' ? 'Name can\'t start or end with <code>-</code> or <code>_</code>.'
+        : 'That name has invalid characters.';
+      await tgSend(chatId, explain + ' Send /new and pick another.');
+      return;
+    }
+    if (findProjectByName(v.name)) {
+      return await tgSend(chatId,
+        `A project named <code>${esc(v.name)}</code> already exists. Send /new and pick another.`
+      );
+    }
+    return await sendNewPreview(chatId, v.name);
+  }
+  // No argument — start wizard
+  setPending(user.tg_user_id);
+  await sendNewPrompt(chatId);
 }
 
 async function handleCallback(cq) {
@@ -442,6 +587,7 @@ async function handleCallback(cq) {
     return;
   }
 
+  // forget:<token>
   if (data.startsWith('forget:')) {
     const tok = data.slice(7);
     const ok = unbindToken(cq.from.id, tok);
@@ -449,6 +595,48 @@ async function handleCallback(cq) {
     if (ok) await tgSend(chatId, 'Binding removed.');
     return;
   }
+
+  // new:cancel
+  if (data === 'new:cancel') {
+    clearPending(cq.from.id);
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Cancelled' });
+    try { await tgApi('editMessageText', {
+      chat_id: chatId, message_id: cq.message.message_id,
+      text: '✕ Cancelled.', parse_mode: 'HTML',
+    }); } catch (e) {}
+    return;
+  }
+
+  // new:rename — re-enter wizard
+  if (data === 'new:rename') {
+    setPending(cq.from.id);
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
+    try { await tgApi('editMessageText', {
+      chat_id: chatId, message_id: cq.message.message_id,
+      text: '✎ Send a new name as your next message.\n\n<i>Allowed: a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.</i>',
+      parse_mode: 'HTML',
+    }); } catch (e) {}
+    return;
+  }
+
+  // new:confirm:<name>
+  if (data.startsWith('new:confirm:')) {
+    const name = data.slice('new:confirm:'.length);
+    const v = validateProjectName(name);
+    if (!v.ok) {
+      await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Invalid name', show_alert: true });
+      return;
+    }
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Creating...' });
+    // Replace the preview with a "creating" stub so the user sees something happen
+    try { await tgApi('editMessageText', {
+      chat_id: chatId, message_id: cq.message.message_id,
+      text: `⏳ Creating <code>${esc(v.name)}</code>...`, parse_mode: 'HTML',
+    }); } catch (e) {}
+    await actuallyCreateProject(chatId, user, v.name);
+    return;
+  }
+
   await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
 }
 
@@ -472,36 +660,6 @@ async function sendForgetMenu(chatId, user) {
     callback_data: 'forget:' + b.token,
   }]);
   await tgSend(chatId, 'Pick a binding to forget:', { reply_markup: { inline_keyboard: kb } });
-}
-
-// /new — anyone (premium) can create a project. They become its owner (PAP).
-async function handleNew(chatId, user, requestedName) {
-  if (!serverHelpers.createProject) {
-    return await tgSend(chatId, 'Internal error: createProject not wired');
-  }
-  let name = String(requestedName || '').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,40);
-  if (!name) {
-    name = 'pad-' + crypto.randomBytes(3).toString('hex'); // dash instead of underscore for safer URLs in chat
-  }
-  const owner = user.tg_username || user.first_name || ('user_' + user.tg_user_id);
-  try {
-    const res = await serverHelpers.createProject({ name, description: 'Created via Telepath by ' + owner });
-    bindToken(user.tg_user_id, { tier: 'pap', token: res.pap_token, project: { name: res.project } });
-    const html =
-      '🎉 Project <code>' + esc(res.project) + '</code> is yours.\n\n' +
-      'Live URL: <a href="' + esc(res.live_url) + '">' + esc(res.live_url) + '</a>\n\n' +
-      'Tap below to open the dashboard, then start building by talking to Claude.';
-    await tgSend(chatId, html, {
-      reply_markup: { inline_keyboard: dashboardKeyboardForBinding({ tier: 'pap', token: res.pap_token, project_name: res.project }) },
-    });
-    notifySAPOwners(`🆕 New project via /new: <code>${esc(res.project)}</code> by ${esc(owner)}`);
-  } catch (e) {
-    let msg = 'Failed: ' + esc(e.message);
-    if (e.message === 'exists') msg = 'A project with that name already exists. Try a different name: <code>/new my-name</code>';
-    if (e.message === 'reserved_name') msg = 'That name is reserved by the system. Try another: <code>/new my-name</code>';
-    if (e.message === 'invalid_name') msg = 'Invalid name. Use only lowercase letters, digits, <code>-</code>, <code>_</code> (max 40).';
-    await tgSend(chatId, msg);
-  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -555,6 +713,7 @@ async function configureBotProfile() {
     { command: 'help',     description: 'Show available commands' },
     { command: 'forget',   description: 'Remove a token binding' },
     { command: 'notif',    description: 'Toggle notifications: /notif on or /notif off' },
+    { command: 'cancel',   description: 'Cancel the current /new flow' },
     { command: 'start',    description: 'Welcome message' },
   ];
   const shortDesc = 'Build websites by talking to Claude. Premium-only.';
@@ -767,7 +926,7 @@ function initDataAuth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WebApp shell HTML (unchanged from v0.4.1)
+// WebApp shell HTML (unchanged)
 // ─────────────────────────────────────────────────────────────
 function renderWebAppShell(tier, token) {
   const stateUrl = '/telepath/api/state/' + tier + (token ? '/' + token : '');
