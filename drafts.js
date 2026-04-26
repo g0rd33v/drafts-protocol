@@ -1,4 +1,4 @@
-// drafts v0.3 — Three-tier access model + clean public URLs.
+// drafts v0.4 — Three-tier access model + Telepath (Telegram bot integration).
 //
 // Public URL scheme:
 //   /<n>/                     -> live
@@ -7,11 +7,13 @@
 //   /<n>/v/<N>/<path>         -> file from snapshot N
 //   /drafts/pass/<token>         -> welcome (SAP/PAP/AAP)
 //   /drafts/...                  -> API
+//   /telepath/app/{sap|pap|aap}  -> Telegram WebApp dashboards
 //
 // Tiers:
 //   SAP — server root
 //   PAP — project owner
 //   AAP — contributor
+//   TAP — Telegram bot pass (set by SAP, attaches a bot to this server)
 //
 // Spec & registry: https://github.com/g0rd33v/drafts-protocol
 
@@ -24,6 +26,7 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import dotenv from 'dotenv';
 import { buildRichContext } from "./rich-context.js";
+import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathStatus } from "./telepath.js";
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -45,10 +48,10 @@ const CHROME_EXT_URL  = 'https://chromewebstore.google.com/detail/claude-for-chr
 // Reserved project names — these collide with API/system paths
 const RESERVED_NAMES = new Set([
   'drafts', 'live', 'api', 'pass', 'v', 'version', 'versions',
-  'health', 'whoami', 'projects', 'aaps', 'aap', 'pap', 'sap',
+  'health', 'whoami', 'projects', 'aaps', 'aap', 'pap', 'sap', 'tap',
   'static', 'assets', 'admin', 'www', '_', 'config', 'github',
   'upload', 'commit', 'promote', 'rollback', 'pending', 'merge',
-  'files', 'file', 'history', 'about', 'gallery', 'docs',
+  'files', 'file', 'history', 'about', 'gallery', 'docs', 'telepath',
 ]);
 
 // Auto-mint SAP on first run if not provided
@@ -125,6 +128,44 @@ function resolveGithubConfig(project) {
     return { user: GITHUB_USER, token: GITHUB_TOKEN, source: 'env' };
   }
   return null;
+}
+
+// Internal helper: create project (extracted so Telepath can reuse it)
+async function _createProjectInternal({ name, description = '', github_repo = null, pap_name = null }) {
+  name = sanitizeName(name);
+  if (!name) throw new Error('invalid_name');
+  if (isReservedName(name)) throw new Error('reserved_name');
+  if (findProjectByName(name)) throw new Error('exists');
+  const pap = { id: newId(), token: newToken('pap'), name: pap_name, created_at: now(), revoked: false };
+  const proj = { name, description, github_repo, created_at: now(), pap, aaps: [] };
+  state.projects.push(proj);
+  saveState();
+  await ensureProjectDirs(name);
+  const papSecret = pap.token.replace(/^pap_/, '');
+  const out = {
+    project: name,
+    pap_token: pap.token,
+    pap_activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${papSecret}`,
+    live_url: `${PUBLIC_BASE}/${name}/`,
+    raw: proj,
+  };
+  // fire telepath hook
+  try { telepathHooks.onNewProject(proj); } catch (e) {}
+  return out;
+}
+
+// Internal helper: create AAP for a project (Telepath uses this)
+async function _createAAPInternal(project, { name = null }) {
+  const aap = { id: newId(), token: newToken('aap'), name: (name || '').toString().slice(0, 60) || null, created_at: now(), revoked: false, branch: '' };
+  aap.branch = `aap/${aap.id}`;
+  project.aaps = project.aaps || [];
+  project.aaps.push(aap);
+  saveState();
+  const aapSecret = aap.token.replace(/^aap_/, '');
+  return {
+    aap: { id: aap.id, name: aap.name, branch: aap.branch, created_at: aap.created_at, token: aap.token },
+    activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -216,9 +257,9 @@ function projectPaths(name) {
   const root = path.join(DRAFTS_DIR, name);
   return {
     root,
-    drafts: path.join(root, 'drafts'),    // git working dir
-    live:   path.join(root, 'live'),       // promoted snapshot
-    versions: path.join(root, 'v'),        // numbered snapshots: v/1/, v/2/, ...
+    drafts: path.join(root, 'drafts'),
+    live:   path.join(root, 'live'),
+    versions: path.join(root, 'v'),
   };
 }
 
@@ -252,11 +293,8 @@ async function switchToBranch(git, branch) {
   }
 }
 
-// Materialize a numbered snapshot of main branch state.
-// Called after every commit on main. N = total user commits on main (init is N=0, first user commit is N=1).
 async function materializeVersion(name) {
   const pp = projectPaths(name);
-  // Use raw git to count main commits — total includes init, so N = total - 1
   let total;
   try {
     total = Number(execSync(`git -C "${pp.drafts}" rev-list --count main`).toString().trim());
@@ -265,7 +303,7 @@ async function materializeVersion(name) {
   }
   const N = Math.max(1, total - 1);
   const dest = path.join(pp.versions, String(N));
-  if (fs.existsSync(dest)) return N; // already materialized this version
+  if (fs.existsSync(dest)) return N;
   const tmp = dest + '.tmp';
   try { execSync(`rm -rf "${tmp}"`); } catch (e) {}
   await fsp.mkdir(pp.versions, { recursive: true });
@@ -275,7 +313,6 @@ async function materializeVersion(name) {
   return N;
 }
 
-// Copy main into live atomically
 async function promoteToLive(name) {
   const pp = projectPaths(name);
   const tmp = pp.live + '.tmp';
@@ -331,7 +368,6 @@ function mimeFor(filename) {
   return MIME[ext] || 'application/octet-stream';
 }
 
-// Safe path resolution under a root
 function resolveSafe(root, rel) {
   const cleaned = rel.replace(/\.\.+/g, '').replace(/^\/+/, '');
   const full = path.resolve(root, cleaned);
@@ -339,7 +375,6 @@ function resolveSafe(root, rel) {
   return full;
 }
 
-// Serve a static file from a directory. Falls back to index.html for directory paths.
 function serveStatic(rootDir, relPath, res) {
   const full = resolveSafe(rootDir, relPath);
   if (!full) return res.status(400).type('text/plain').send('bad path');
@@ -369,7 +404,13 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 // Health
-app.get('/drafts/health', (req, res) => res.json({ ok: true, version: '0.3', protocol: 'drafts', server_number: SERVER_NUMBER }));
+app.get('/drafts/health', (req, res) => {
+  const tp = getTelepathStatus();
+  res.json({ ok: true, version: '0.4', protocol: 'drafts', server_number: SERVER_NUMBER, telepath: tp });
+});
+
+// Mount Telepath routes (TAP management + WebApp + Telepath API).
+mountTelepathRoutes(app);
 
 // ─────────────────────────────────────────────────────────────
 // Welcome page rendering
@@ -391,9 +432,11 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   const cleanTok = token.replace(/^(pap|aap)_/, "");
   const portableId = `${PUBLIC_BASE}/drafts/pass/drafts_${tierWord}_${SERVER_NUMBER}_${cleanTok}`;
 
+  const tpStatus = getTelepathStatus();
+
   const machine = {
     system: 'drafts',
-    version: '0.3',
+    version: '0.4',
     tier,
     api_base: apiBase,
     auth: { header: 'Authorization', scheme: 'Bearer', token },
@@ -401,6 +444,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     server_number: SERVER_NUMBER,
     registry_url: 'https://github.com/g0rd33v/drafts-protocol/blob/main/drafts-registry.json',
     public_gallery: PUBLIC_BASE + '/',
+    telepath: tpStatus.installed ? { bot_username: tpStatus.bot?.username, polling: tpStatus.polling } : { installed: false },
     url_scheme: project ? {
       live: `${PUBLIC_BASE}/${project.name}/`,
       live_file: `${PUBLIC_BASE}/${project.name}/<path>`,
@@ -417,13 +461,16 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     conversation_tone: { mode: 'friendly, builder-energy', emoji_policy: 'sparing', response_length: 'short' },
     on_first_load: { summary: project ? `Check ${apiBase}/project/info + files + history and greet based on state.` : 'Greet warmly, offer overview.' },
     transport: 'Try built-in HTTP tools first; on failure switch to Claude for Chrome silently.',
-    capabilities: isSAP ? ['list_projects','create_project','delete_project','revoke_passes','configure_github_default']
+    capabilities: isSAP ? ['list_projects','create_project','delete_project','revoke_passes','configure_github_default','manage_telepath_bot']
       : isPAP ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync']
       : ['build_in_branch','read_live','read_history'],
     endpoints: isSAP ? [
       { method: 'GET', path: '/projects' },
       { method: 'POST', path: '/projects', body: '{name, description?, github_repo?}' },
       { method: 'DELETE', path: '/projects/:name' },
+      { method: 'GET', path: '/tap' },
+      { method: 'PUT', path: '/tap', body: '{token}' },
+      { method: 'DELETE', path: '/tap' },
     ] : isPAP ? [
       { method: 'GET', path: '/project/info' },
       { method: 'GET', path: '/project/versions' },
@@ -452,6 +499,12 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     ? `Your project. Live at ${PUBLIC_BASE}/${project.name}/. ${versions.length} versions.`
     : `Contributor link to ${project.name}. Your changes go to your own branch.`;
 
+  // SAP-only: TAP management section (shown only on SAP welcome page, after rich context)
+  let tapSection = '';
+  if (isSAP) {
+    tapSection = renderTapSection(tpStatus, token);
+  }
+
   let html = '';
   html += '<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>';
   html += `<title>${title}</title><meta name="robots" content="noindex,nofollow"/>`;
@@ -464,6 +517,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   html += '</style></head><body><div class="wrap">';
   html += `<span class="badge">${roleBadge}</span><h1>${welcomeH1}</h1><p class="lead">${subline}</p>`;
   html += buildRichContext({ tier, token, project, projectsDir: DRAFTS_DIR, publicBase: PUBLIC_BASE });
+  html += tapSection;
   html += `<a class="btn" href="${CHROME_EXT_URL}" target="_blank">Install Claude for Chrome ↗</a>`;
   html += `<button class="btn" id="copyUrlBtn" type="button" data-portable="${portableId}" style="background:rgba(96,165,250,0.15);border:none;color:#93c5fd;cursor:pointer;font-family:inherit;font-size:14px">Copy link</button>`;
   if (project) {
@@ -476,6 +530,64 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   html += '<script type="application/json" id="claude-instructions">' + JSON.stringify(machine, null, 2) + '</' + 'script>';
   html += '</div></body></html>';
   return html;
+}
+
+// SAP-only TAP setup section, lives in welcome page
+function renderTapSection(tpStatus, sapToken) {
+  let inner;
+  if (tpStatus.installed && tpStatus.bot) {
+    inner = `
+      <div style="font-size:13px;color:#a8a8a8;margin-bottom:8px">Connected as <strong style="color:#f5f5f5">@${tpStatus.bot.username}</strong> · polling: ${tpStatus.polling ? '<span style="color:#4ade80">on</span>' : '<span style="color:#ea5a2e">off</span>'}</div>
+      <div style="font-size:12px;color:#6a6a6a;margin-bottom:14px">Open the bot in Telegram → send your SAP/PAP/AAP token → get a dashboard.</div>
+      <button id="tapDisconnect" type="button" style="padding:8px 14px;border-radius:8px;background:transparent;border:1px solid rgba(234,90,46,0.4);color:#ea5a2e;font-weight:600;font-size:12px;cursor:pointer">Disconnect bot</button>
+    `;
+  } else {
+    inner = `
+      <div style="font-size:13px;color:#a8a8a8;margin-bottom:14px">Drafts Telepath isn't connected to a bot yet. Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color:#60a5fa">@BotFather</a> on Telegram, then paste its API token below to bring this server's data into your DM.</div>
+      <input id="tapTokenInput" type="password" placeholder="123456789:AA..." style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#000;color:#f5f5f5;font-family:ui-monospace,Menlo,monospace;font-size:13px;box-sizing:border-box;margin-bottom:10px"/>
+      <button id="tapInstall" type="button" style="padding:10px 18px;border-radius:8px;background:#ea5a2e;border:none;color:#fff;font-weight:600;font-size:13px;cursor:pointer">Connect bot</button>
+      <div id="tapStatus" style="margin-top:10px;font-size:12px;color:#6a6a6a"></div>
+    `;
+  }
+  return `
+    <div style="background:#0c0c0c;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:20px 22px;margin:28px 0;">
+      <h3 style="font-size:11px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#6a6a6a;margin:0 0 14px 0;">
+        <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${tpStatus.installed ? '#4ade80' : '#6a6a6a'};margin-right:8px;vertical-align:middle"></span>
+        Telepath · Telegram bot
+      </h3>
+      ${inner}
+    </div>
+    <script>
+    (function(){
+      var sap = ${JSON.stringify(sapToken)};
+      var hdr = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sap };
+      var btnI = document.getElementById('tapInstall');
+      if (btnI) {
+        btnI.addEventListener('click', function() {
+          var tok = (document.getElementById('tapTokenInput').value || '').trim();
+          var status = document.getElementById('tapStatus');
+          if (!/^\\d+:[A-Za-z0-9_-]{30,}$/.test(tok)) { status.textContent = 'Invalid token format. It should look like 1234567:AA...'; status.style.color='#ea5a2e'; return; }
+          status.textContent = 'Verifying with Telegram...'; status.style.color='#a8a8a8';
+          fetch('/drafts/tap', { method:'PUT', headers: hdr, body: JSON.stringify({ token: tok }) })
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+              if (j.ok) { status.textContent = 'Connected as @' + j.bot.username + '. Reload to see status.'; status.style.color='#4ade80'; setTimeout(function(){ location.reload(); }, 1500); }
+              else { status.textContent = 'Failed: ' + (j.detail || j.error); status.style.color='#ea5a2e'; }
+            })
+            .catch(function(e){ status.textContent = 'Network error: ' + e.message; status.style.color='#ea5a2e'; });
+        });
+      }
+      var btnD = document.getElementById('tapDisconnect');
+      if (btnD) {
+        btnD.addEventListener('click', function() {
+          if (!confirm('Disconnect bot? Users will lose access until you reconnect.')) return;
+          fetch('/drafts/tap', { method:'DELETE', headers: hdr })
+            .then(function(){ location.reload(); });
+        });
+      }
+    })();
+    </script>
+  `;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -536,6 +648,7 @@ app.get('/drafts/server/stats', authSAP, (req, res) => {
   res.json({
     ok: true, server_number: SERVER_NUMBER, total_projects: state.projects.length,
     github_default_configured: !!(state.github_default && state.github_default.token),
+    telepath: getTelepathStatus(),
     projects: state.projects.map(p => ({ name: p.name, created_at: p.created_at, aap_count: (p.aaps || []).filter(a => !a.revoked).length })),
   });
 });
@@ -553,21 +666,18 @@ app.get('/drafts/projects', authSAP, (req, res) => {
 });
 
 app.post('/drafts/projects', authSAP, async (req, res) => {
-  const name = sanitizeName(req.body.name);
-  if (!name) return res.status(400).json({ ok: false, error: 'invalid_name' });
-  if (isReservedName(name)) return res.status(400).json({ ok: false, error: 'reserved_name', detail: `"${name}" is a system path` });
-  if (findProjectByName(name)) return res.status(409).json({ ok: false, error: 'exists' });
-  const pap = { id: newId(), token: newToken('pap'), name: req.body.pap_name || null, created_at: now(), revoked: false };
-  const proj = { name, description: req.body.description || '', github_repo: req.body.github_repo || null, created_at: now(), pap, aaps: [] };
-  state.projects.push(proj);
-  saveState();
-  await ensureProjectDirs(name);
-  const papSecret = pap.token.replace(/^pap_/, '');
-  res.json({
-    ok: true, project: name,
-    pap_activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${papSecret}`,
-    live_url: `${PUBLIC_BASE}/${name}/`,
-  });
+  try {
+    const out = await _createProjectInternal({
+      name: req.body.name,
+      description: req.body.description || '',
+      github_repo: req.body.github_repo || null,
+      pap_name: req.body.pap_name || null,
+    });
+    res.json({ ok: true, project: out.project, pap_activation_url: out.pap_activation_url, live_url: out.live_url });
+  } catch (e) {
+    const code = e.message === 'invalid_name' ? 400 : e.message === 'reserved_name' ? 400 : e.message === 'exists' ? 409 : 500;
+    res.status(code).json({ ok: false, error: e.message });
+  }
 });
 
 app.delete('/drafts/projects/:name', authSAP, async (req, res) => {
@@ -638,21 +748,16 @@ app.get('/drafts/project/versions', authAny, async (req, res) => {
   res.json({ ok: true, project: p.name, versions: out });
 });
 
-app.post('/drafts/aaps', authPAPorSAP, (req, res) => {
+app.post('/drafts/aaps', authPAPorSAP, async (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.body.project || ''));
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
-  const aap = { id: newId(), token: newToken('aap'), name: (req.body.name || '').toString().slice(0, 60) || null, created_at: now(), revoked: false, branch: '' };
-  aap.branch = `aap/${aap.id}`;
-  p.aaps = p.aaps || [];
-  p.aaps.push(aap);
-  saveState();
-  const aapSecret = aap.token.replace(/^aap_/, '');
-  const activationUrl = `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`;
+  const out = await _createAAPInternal(p, { name: req.body.name });
+  try { telepathHooks.onNewAAPCreated(p, out.aap); } catch (e) {}
   res.json({
     ok: true,
-    aap: { id: aap.id, name: aap.name, branch: aap.branch, created_at: aap.created_at },
-    activation_url: activationUrl,
-    email_draft_hint: { subject: `You're invited to "${p.name}" on drafts`, body: `Hey,\n\nYour link: ${activationUrl}\n\nLive: ${PUBLIC_BASE}/${p.name}/\n\nCheers,\n` },
+    aap: out.aap,
+    activation_url: out.activation_url,
+    email_draft_hint: { subject: `You're invited to "${p.name}" on drafts`, body: `Hey,\n\nYour link: ${out.activation_url}\n\nLive: ${PUBLIC_BASE}/${p.name}/\n\nCheers,\n` },
   });
 });
 
@@ -716,6 +821,7 @@ app.post('/drafts/merge', authPAPorSAP, async (req, res) => {
     await git.checkout('main');
     await git.merge([`aap/${aap.id}`, '--no-ff', '-m', `merge aap/${aap.name || aap.id}`]);
     const N = await materializeVersion(p.name);
+    try { telepathHooks.onAAPMerged(p, aap, N); } catch (e) {}
     res.json({ ok: true, merged: aap.id, branch: `aap/${aap.id}`, version: N, version_url: `${PUBLIC_BASE}/${p.name}/v/${N}/` });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'merge_failed', detail: e.message });
@@ -758,6 +864,7 @@ app.post('/drafts/commit', authAny, async (req, res) => {
     if (branch === 'main' && out.commit) {
       const N = await materializeVersion(p.name);
       versionInfo = { n: N, url: `${PUBLIC_BASE}/${p.name}/v/${N}/` };
+      try { telepathHooks.onMainCommit(p, { commit: out.commit, summary: out.summary, message: msg }, N); } catch (e) {}
     }
     res.json({ ok: true, branch, commit: out.commit, summary: out.summary, version: versionInfo });
   } catch (e) {
@@ -802,7 +909,6 @@ app.get('/drafts/file', authAny, async (req, res) => {
   }
   const full = path.join(where === 'live' ? pp.live : pp.drafts, relPath);
   if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return res.status(404).json({ ok: false, error: 'not_found' });
-  // Try utf-8 first; if it fails, return base64
   try {
     const content = fs.readFileSync(full, 'utf8');
     res.json({ ok: true, path: relPath, where, content });
@@ -953,7 +1059,7 @@ app.post('/drafts/github/sync', authPAPorSAP, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// Public project routes — must come AFTER all /drafts/* routes
+// Public project routes — must come AFTER all /drafts/* and /telepath/* routes
 // ─────────────────────────────────────────────────────────────
 
 function isProjectName(slug) {
@@ -966,7 +1072,7 @@ function isProjectName(slug) {
 app.use((req, res, next) => {
   if (req.method !== 'GET' && req.method !== 'HEAD') return next();
   const url = req.path;
-  if (url.startsWith('/drafts/') || url.startsWith('/m/')) return next();
+  if (url.startsWith('/drafts/') || url.startsWith('/m/') || url.startsWith('/telepath/')) return next();
   const m = url.match(/^\/([a-z0-9_-]+)(\/.*)?$/);
   if (!m) return next();
   const name = m[1];
@@ -988,9 +1094,28 @@ app.use((req, res, next) => {
 });
 
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`drafts v0.3 listening on 127.0.0.1:${PORT}`);
+  console.log(`drafts v0.4 listening on 127.0.0.1:${PORT}`);
   console.log(`  public_base: ${PUBLIC_BASE}`);
   console.log(`  server_number: ${SERVER_NUMBER}`);
   console.log(`  data_dir: ${DRAFTS_DIR}`);
   console.log(`  SAP welcome: ${PUBLIC_BASE}/drafts/pass/drafts_server_${SERVER_NUMBER}_${SAP_TOKEN.slice(0,8)}... (full token in /etc/labs/drafts.sap)`);
+
+  // Initialize Telepath (loads TAP and starts long-polling if installed)
+  initTelepath({
+    draftsDir: DRAFTS_DIR,
+    publicBase: PUBLIC_BASE,
+    serverNumber: SERVER_NUMBER,
+    getSAP: () => SAP_TOKEN,
+    getDraftsState: () => state,
+    saveDraftsState: saveState,
+    findProjectByName,
+    findProjectByPAP,
+    findProjectAndAAPByAAPToken,
+    ensureProjectDirs,
+    listVersions,
+    serverHelpers: {
+      createProject: _createProjectInternal,
+      createAAP: _createAAPInternal,
+    },
+  });
 });
