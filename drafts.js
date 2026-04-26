@@ -1,4 +1,4 @@
-// drafts v0.5 — Three-tier access model + Telepath + Project Bots.
+// drafts v0.6 — Three-tier access model + Telepath + Project Bots (webhook forwarder).
 //
 // Public URL scheme:
 //   /<n>/                     -> live
@@ -14,7 +14,7 @@
 //   PAP — project owner
 //   AAP — contributor
 //   TAP — Telegram bot pass (set by SAP, attaches a bot to this server)
-//   PBOT — per-project bot (set by PAP via WebApp, attaches a public bot to a project)
+//   PBOT — per-project bot (set by PAP via WebApp, two modes: default or webhook)
 //
 // Spec & registry: https://github.com/g0rd33v/drafts-protocol
 
@@ -29,6 +29,8 @@ import dotenv from 'dotenv';
 import { buildRichContext } from "./rich-context.js";
 import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathStatus } from "./telepath.js";
 import { initProjectBots } from "./project-bots.js";
+
+const VERSION = '0.6';
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -97,6 +99,22 @@ function saveState() {
   fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 }
 loadState();
+
+// One-time migration: ensure every project.bot has webhook_url + webhook_log fields (v0.6 schema)
+function migrateProjectBotsToV06() {
+  let changed = 0;
+  for (const p of state.projects) {
+    if (p.bot && p.bot.token) {
+      if (!('webhook_url' in p.bot)) { p.bot.webhook_url = null; changed++; }
+      if (!Array.isArray(p.bot.webhook_log)) { p.bot.webhook_log = []; changed++; }
+    }
+  }
+  if (changed > 0) {
+    saveState();
+    console.log(`[drafts] migrated ${changed} bot field(s) to v0.6 schema`);
+  }
+}
+migrateProjectBotsToV06();
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -410,7 +428,17 @@ app.use(express.json({ limit: '10mb' }));
 // Health
 app.get('/drafts/health', (req, res) => {
   const tp = getTelepathStatus();
-  res.json({ ok: true, version: '0.5', protocol: 'drafts', server_number: SERVER_NUMBER, telepath: tp });
+  const projectBotsCount = state.projects.filter(p => p.bot && p.bot.token).length;
+  const webhookBotsCount = state.projects.filter(p => p.bot && p.bot.token && p.bot.webhook_url).length;
+  res.json({
+    ok: true,
+    version: VERSION,
+    protocol: 'drafts',
+    server_number: SERVER_NUMBER,
+    telepath: tp,
+    project_bots: { total: projectBotsCount, in_webhook_mode: webhookBotsCount },
+    uptime_sec: Math.floor(process.uptime()),
+  });
 });
 
 // Mount Telepath routes (TAP management + WebApp + Telepath API + Project Bots API).
@@ -440,7 +468,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
 
   const machine = {
     system: 'drafts',
-    version: '0.5',
+    version: VERSION,
     tier,
     api_base: apiBase,
     auth: { header: 'Authorization', scheme: 'Bearer', token },
@@ -466,7 +494,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     on_first_load: { summary: project ? `Check ${apiBase}/project/info + files + history and greet based on state.` : 'Greet warmly, offer overview.' },
     transport: 'Try built-in HTTP tools first; on failure switch to Claude for Chrome silently.',
     capabilities: isSAP ? ['list_projects','create_project','delete_project','revoke_passes','configure_github_default','manage_telepath_bot']
-      : isPAP ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','attach_telegram_bot']
+      : isPAP ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','attach_telegram_bot','set_bot_webhook_url']
       : ['build_in_branch','read_live','read_history'],
     endpoints: isSAP ? [
       { method: 'GET', path: '/projects' },
@@ -652,7 +680,12 @@ app.get('/drafts/server/stats', authSAP, (req, res) => {
     ok: true, server_number: SERVER_NUMBER, total_projects: state.projects.length,
     github_default_configured: !!(state.github_default && state.github_default.token),
     telepath: getTelepathStatus(),
-    projects: state.projects.map(p => ({ name: p.name, created_at: p.created_at, aap_count: (p.aaps || []).filter(a => !a.revoked).length, bot_attached: !!(p.bot && p.bot.token) })),
+    projects: state.projects.map(p => ({
+      name: p.name, created_at: p.created_at,
+      aap_count: (p.aaps || []).filter(a => !a.revoked).length,
+      bot_attached: !!(p.bot && p.bot.token),
+      bot_mode: p.bot && p.bot.token ? (p.bot.webhook_url ? 'webhook' : 'default') : null,
+    })),
   });
 });
 
@@ -664,7 +697,13 @@ app.get('/drafts/projects', authSAP, (req, res) => {
       created_at: p.created_at, live_url: `${PUBLIC_BASE}/${p.name}/`,
       pap: p.pap ? { id: p.pap.id, revoked: p.pap.revoked, activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${p.pap.token.replace(/^pap_/,'')}` } : null,
       aaps: (p.aaps || []).map(a => ({ id: a.id, name: a.name, revoked: a.revoked })),
-      bot: p.bot ? { bot_username: p.bot.bot_username, subscriber_count: (p.bot.subscribers || []).length, last_synced_at: p.bot.last_synced_at } : null,
+      bot: p.bot ? {
+        bot_username: p.bot.bot_username,
+        subscriber_count: (p.bot.subscribers || []).length,
+        last_synced_at: p.bot.last_synced_at,
+        mode: p.bot.webhook_url ? 'webhook' : 'default',
+        webhook_url: p.bot.webhook_url || null,
+      } : null,
     })),
   });
 });
@@ -704,7 +743,13 @@ app.delete('/drafts/projects/:name/pap', authSAP, (req, res) => {
 app.get('/drafts/project/info', authAny, (req, res) => {
   const p = req.project;
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
-  res.json({ ok: true, project: p.name, description: p.description, github_repo: p.github_repo, created_at: p.created_at, live_url: `${PUBLIC_BASE}/${p.name}/`, viewer_tier: req.tier, bot_attached: !!(p.bot && p.bot.token), bot_username: p.bot?.bot_username || null });
+  res.json({
+    ok: true, project: p.name, description: p.description, github_repo: p.github_repo,
+    created_at: p.created_at, live_url: `${PUBLIC_BASE}/${p.name}/`, viewer_tier: req.tier,
+    bot_attached: !!(p.bot && p.bot.token),
+    bot_username: p.bot?.bot_username || null,
+    bot_mode: p.bot && p.bot.token ? (p.bot.webhook_url ? 'webhook' : 'default') : null,
+  });
 });
 
 app.get('/drafts/project/stats', authPAPorSAP, async (req, res) => {
@@ -724,7 +769,14 @@ app.get('/drafts/project/stats', authPAPorSAP, async (req, res) => {
       recent_commits: log.all.map(c => ({ hash: c.hash.slice(0,7), message: c.message, date: c.date })),
       live_files_count: liveFiles.length,
       versions: { count: versions.length, latest: versions[versions.length - 1] || null, all: versions },
-      bot: p.bot ? { bot_username: p.bot.bot_username, subscribers: (p.bot.subscribers || []).length, last_synced_at: p.bot.last_synced_at } : null,
+      bot: p.bot ? {
+        bot_username: p.bot.bot_username,
+        subscribers: (p.bot.subscribers || []).length,
+        last_synced_at: p.bot.last_synced_at,
+        mode: p.bot.webhook_url ? 'webhook' : 'default',
+        webhook_url: p.bot.webhook_url || null,
+        webhook_log_count: (p.bot.webhook_log || []).length,
+      } : null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'stats_failed', detail: e.message });
@@ -1099,7 +1151,7 @@ app.use((req, res, next) => {
 });
 
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`drafts v0.5 listening on 127.0.0.1:${PORT}`);
+  console.log(`drafts v${VERSION} listening on 127.0.0.1:${PORT}`);
   console.log(`  public_base: ${PUBLIC_BASE}`);
   console.log(`  server_number: ${SERVER_NUMBER}`);
   console.log(`  data_dir: ${DRAFTS_DIR}`);
