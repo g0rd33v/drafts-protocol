@@ -1,32 +1,17 @@
-// telepath.js — Drafts Telepath: Telegram bot integration for Drafts servers.
+// telepath.js — Drafts Telepath: control-plane Telegram bot for Drafts servers.
 //
-// Concept:
-//   One Drafts server ↔ one Telegram bot.
-//   Owner (SAP) installs the bot by pasting its token via TAP.
-//   Users send their PAP/AAP/SAP into the bot → the bot binds it
-//   to their Telegram user_id and opens the matching mini-app.
-//
-// Access policy:
-//   The bot is restricted to Telegram Premium users. Non-premium users get
-//   a polite refusal. SAP-bound users always pass (server owner).
-//
-// /new flow (v0.4.3):
-//   1. /new (no args) → bot asks for a name, shows URL preview format
-//   2. user types a name → bot validates, shows the exact URL preview + Confirm/Cancel buttons
-//   3. /new <name> → same as above, but skips step 1
-//   4. user taps Confirm → project is created, dashboard button appears
-//
-// Formatting:
-//   All bot messages use parse_mode: 'HTML'. Underscores in URLs/identifiers
-//   would break Markdown parsing.
-//
-// State:  /var/lib/drafts/.telepath.json
+// v0.5: project bots integration. Each PAP project can attach its own
+// Telegram bot via the PAP WebApp dashboard. Project bots are managed
+// by the project-bots.js module (independent long-pollers, profile sync,
+// broadcast). This file exposes the management endpoints and renders
+// the WebApp UI for them.
 
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import https from 'https';
+import { projectBotsApi } from './project-bots.js';
 
 // ─────────────────────────────────────────────────────────────
 // Config
@@ -47,7 +32,7 @@ let serverHelpers = {};
 const STATE_VERSION = 1;
 const POLL_TIMEOUT  = 25;
 const TAP_FILE      = '/etc/labs/drafts.tap';
-const PENDING_TTL_MS = 10 * 60 * 1000; // 10 min — pending name request expires
+const PENDING_TTL_MS = 10 * 60 * 1000;
 
 let TAP = null;
 let telepathState = null;
@@ -55,9 +40,6 @@ let polling = false;
 let pollOffset = 0;
 let botMeRefreshTimer = null;
 
-// pending_create — short-lived, in-memory map of pending project-create flows.
-// Key: tg_user_id, value: { name, expires_at, message_id_to_edit }
-// Stored separately from persistent telepathState so restarts simply cancel pending flows.
 const pendingCreate = new Map();
 
 // ─────────────────────────────────────────────────────────────
@@ -133,8 +115,13 @@ function persistTAP() {
   }
 }
 
+// Public getter so project-bots.js can append "Built with Drafts → @<username>" to its messages
+export function getControlBotUsername() {
+  return TAP && TAP.bot ? TAP.bot.username : null;
+}
+
 // ─────────────────────────────────────────────────────────────
-// Telegram HTTP client
+// Telegram HTTP client (control-plane bot only)
 // ─────────────────────────────────────────────────────────────
 function tgApi(method, params = {}, opts = {}) {
   if (!TAP || !TAP.token) return Promise.reject(new Error('no_tap'));
@@ -308,10 +295,9 @@ function isAllowed(tgFrom, user) {
 }
 
 const PREMIUM_REFUSAL =
-  '<b>Telegram Premium required</b>\n\n' +
-  'This bot is open to Telegram Premium subscribers only. ' +
-  'Upgrade to Premium in Telegram Settings to use Drafts.\n\n' +
-  '<i>If you are the server owner, paste your SAP token first to unlock access.</i>';
+  '<b>Premium only ✨</b>\n\n' +
+  'Drafts is free, but you need Telegram Premium to use it.\n' +
+  'Upgrade in Telegram Settings → Premium.';
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -326,36 +312,35 @@ function tierBadge(tier) {
 
 function welcomeText(user) {
   const name = user && user.first_name ? user.first_name : 'there';
-  let t = `<b>Drafts Telepath</b>\nHi ${esc(name)} 👋\n\n`;
-  t += `Build a website by talking to Claude. This bot is your control center for <code>${esc(publicHostname())}</code>.\n\n`;
-  t += '<b>To get started:</b>\n';
-  t += '• /new — create your own project (free)\n';
-  t += '• Or paste a <code>pap_…</code> / <code>aap_…</code> token to open an existing one\n\n';
-  t += '<b>Other commands:</b> /help · /projects · /forget';
+  let t = `<b>Drafts</b> ✦ build by talking to Claude\n\n`;
+  t += `gm ${esc(name)} 👋\n\n`;
+  t += '/new — make a project\n';
+  t += 'or paste a <code>pap_…</code> / <code>aap_…</code> to open one\n\n';
+  t += '/help · /projects · /forget';
   return t;
 }
 
 function helpText() {
-  let t = '<b>Drafts Telepath — commands</b>\n\n';
-  t += '/new — create a new project (you become its owner)\n';
-  t += '/projects — list your projects and open dashboards\n';
-  t += '/forget — remove a token binding\n';
-  t += '/notif <code>on|off</code> — toggle notifications\n';
-  t += '/start — show the welcome message\n';
-  t += '/help — show this message\n\n';
-  t += 'You can also paste any <code>pap_…</code>, <code>aap_…</code>, or <code>/drafts/pass/…</code> link directly into the chat.';
+  let t = '<b>commands</b>\n\n';
+  t += '/new — new project\n';
+  t += '/projects — your projects\n';
+  t += '/forget — drop a token\n';
+  t += '/notif <code>on|off</code> — notifications\n';
+  t += '/start — welcome\n';
+  t += '/help — this\n\n';
+  t += 'paste any <code>pap_…</code> or <code>aap_…</code> to open it.';
   return t;
 }
 
 function projectsListText(user) {
   if (!user || user.bindings.length === 0) {
-    return 'No projects yet. Try /new to create one.';
+    return 'nothing here yet. /new to start ✨';
   }
-  let t = '<b>Your linked passes:</b>\n\n';
+  let t = '<b>your stuff</b>\n\n';
   for (const b of user.bindings) {
     t += `${tierBadge(b.tier)}`;
     if (b.project_name) t += ` · <code>${esc(b.project_name)}</code>`;
-    t += ` · ${b.bound_at.slice(0,10)}\n`;
+    t += `\n`;
   }
   return t;
 }
@@ -364,63 +349,56 @@ function dashboardKeyboardForBinding(binding) {
   let url, label;
   if (binding.tier === 'sap') {
     url = webAppUrl('sap');
-    label = '🔑 Server admin';
+    label = '🔑 server admin';
   } else if (binding.tier === 'pap') {
     url = webAppUrl('pap/' + binding.token);
-    label = '📁 Open ' + (binding.project_name || 'project');
+    label = '✨ open ' + (binding.project_name || 'project');
   } else if (binding.tier === 'aap') {
     url = webAppUrl('aap/' + binding.token);
-    label = '🤝 Open agent view';
+    label = '🤝 open agent';
   }
   return [[{ text: label, web_app: { url } }]];
 }
 
 // ─────────────────────────────────────────────────────────────
-// /new flow — interactive wizard
+// /new flow
 // ─────────────────────────────────────────────────────────────
-
-// Validate a project name string. Returns { ok: true, name } or { ok: false, error }.
 function validateProjectName(raw) {
   const name = String(raw || '').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,40);
   if (!name) return { ok: false, error: 'empty' };
   if (name.length < 2) return { ok: false, error: 'too_short' };
   if (/^[-_]/.test(name) || /[-_]$/.test(name)) return { ok: false, error: 'edge_separators' };
-  // Reserved-name check happens server-side in createProject
   return { ok: true, name };
 }
 
 function previewUrl(name) { return PUBLIC_BASE + '/' + name + '/'; }
 
-// Send "what name?" prompt — entry point for /new with no args
 async function sendNewPrompt(chatId) {
   const exampleHost = publicHostname();
   const html =
-    '<b>Create a new project</b>\n\n' +
-    'What do you want to call it? Send the name as your next message.\n\n' +
-    `Your project will live at:\n<code>https://${esc(exampleHost)}/&lt;your-name&gt;/</code>\n\n` +
-    '<i>Allowed: lowercase letters, digits, <code>-</code>, <code>_</code>. 2–40 characters.</i>';
+    '<b>name your project</b>\n\n' +
+    'send a name as your next message ✏️\n\n' +
+    `it'll live at <code>${esc(exampleHost)}/&lt;name&gt;/</code>\n\n` +
+    '<i>a–z, 0–9, <code>-</code>, <code>_</code> · 2–40 chars</i>';
   await tgSend(chatId, html, {
-    reply_markup: { inline_keyboard: [[{ text: '✕ Cancel', callback_data: 'new:cancel' }]] },
+    reply_markup: { inline_keyboard: [[{ text: '✕ cancel', callback_data: 'new:cancel' }]] },
   });
 }
 
-// Show preview + Confirm/Edit/Cancel — entry point for both /new <name> and post-name input
 async function sendNewPreview(chatId, name) {
   const url = previewUrl(name);
   const html =
-    '<b>Ready to create</b>\n\n' +
-    `Name: <code>${esc(name)}</code>\n` +
-    `URL: <a href="${esc(url)}">${esc(url)}</a>\n\n` +
-    'Looks good?';
+    '<b>looks good?</b>\n\n' +
+    `<code>${esc(name)}</code>\n` +
+    `→ <a href="${esc(url)}">${esc(url)}</a>`;
   await tgSend(chatId, html, {
     reply_markup: { inline_keyboard: [
-      [{ text: '✓ Create', callback_data: 'new:confirm:' + name }],
-      [{ text: '✎ Change name', callback_data: 'new:rename' }, { text: '✕ Cancel', callback_data: 'new:cancel' }],
+      [{ text: '✓ create', callback_data: 'new:confirm:' + name }],
+      [{ text: '✎ rename', callback_data: 'new:rename' }, { text: '✕ cancel', callback_data: 'new:cancel' }],
     ]},
   });
 }
 
-// Set pending state for this user — they're expected to send a name as next message
 function setPending(tgUserId) {
   pendingCreate.set(tgUserId, { expires_at: Date.now() + PENDING_TTL_MS });
 }
@@ -432,29 +410,28 @@ function getPending(tgUserId) {
   return p;
 }
 
-// Actually create the project (called from confirm button)
 async function actuallyCreateProject(chatId, user, name) {
   if (!serverHelpers.createProject) {
-    return await tgSend(chatId, 'Internal error: createProject not wired');
+    return await tgSend(chatId, 'oops, internal error.');
   }
   const owner = user.tg_username || user.first_name || ('user_' + user.tg_user_id);
   try {
     const res = await serverHelpers.createProject({ name, description: 'Created via Telepath by ' + owner });
     bindToken(user.tg_user_id, { tier: 'pap', token: res.pap_token, project: { name: res.project } });
     const html =
-      '🎉 <b>Project created</b>\n\n' +
-      `Name: <code>${esc(res.project)}</code>\n` +
-      `Live URL: <a href="${esc(res.live_url)}">${esc(res.live_url)}</a>\n\n` +
-      'Tap below to open the dashboard, then start building by talking to Claude.';
+      '🎉 <b>it\'s yours</b>\n\n' +
+      `<code>${esc(res.project)}</code>\n` +
+      `→ <a href="${esc(res.live_url)}">${esc(res.live_url)}</a>\n\n` +
+      'tap below to open the dashboard, then talk to Claude to build.';
     await tgSend(chatId, html, {
       reply_markup: { inline_keyboard: dashboardKeyboardForBinding({ tier: 'pap', token: res.pap_token, project_name: res.project }) },
     });
-    notifySAPOwners(`🆕 New project via /new: <code>${esc(res.project)}</code> by ${esc(owner)}`);
+    notifySAPOwners(`🆕 new project: <code>${esc(res.project)}</code> by ${esc(owner)}`);
   } catch (e) {
-    let msg = 'Failed: ' + esc(e.message);
-    if (e.message === 'exists') msg = `A project named <code>${esc(name)}</code> already exists. Try a different name with /new.`;
-    if (e.message === 'reserved_name') msg = `<code>${esc(name)}</code> is reserved by the system. Try another name with /new.`;
-    if (e.message === 'invalid_name') msg = 'Invalid name. Use only lowercase letters, digits, <code>-</code>, <code>_</code> (2–40 chars).';
+    let msg = 'failed: ' + esc(e.message);
+    if (e.message === 'exists') msg = `<code>${esc(name)}</code> is taken — try another with /new`;
+    if (e.message === 'reserved_name') msg = `<code>${esc(name)}</code> is reserved — try another with /new`;
+    if (e.message === 'invalid_name') msg = 'invalid name. a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.';
     await tgSend(chatId, msg);
   }
 }
@@ -477,7 +454,6 @@ async function handleMessage(msg) {
   const text = (msg.text || '').trim();
   const user = ensureUser(msg.from);
 
-  // Premium gate — applied to ALL incoming messages except SAP token binding.
   const recogPreview = recognizeToken(text);
   const isSapBindingAttempt = recogPreview && recogPreview.tier === 'sap';
 
@@ -485,11 +461,9 @@ async function handleMessage(msg) {
     return await tgSend(chatId, PREMIUM_REFUSAL);
   }
 
-  // Commands
   if (text.startsWith('/')) {
     const parts = text.split(/\s+/);
     const cmd = parts[0].split('@')[0].toLowerCase();
-    // If user was in /new wizard but issues another command, cancel the wizard silently.
     if (cmd !== '/new') clearPending(msg.from.id);
 
     if (cmd === '/start')    return await sendStart(chatId, user);
@@ -498,26 +472,25 @@ async function handleMessage(msg) {
     if (cmd === '/forget')   return await sendForgetMenu(chatId, user);
     if (cmd === '/new')      return await handleNewCommand(chatId, user, parts.slice(1).join(' '));
     if (cmd === '/cancel') {
-      if (getPending(msg.from.id)) { clearPending(msg.from.id); return await tgSend(chatId, 'Cancelled.'); }
-      return await tgSend(chatId, 'Nothing to cancel.');
+      if (getPending(msg.from.id)) { clearPending(msg.from.id); return await tgSend(chatId, 'cancelled.'); }
+      return await tgSend(chatId, 'nothing to cancel.');
     }
     if (cmd === '/notif') {
       const arg = parts[1];
-      if (arg === 'off') { user.notif_subscribed = false; persistState(); return await tgSend(chatId, '🔕 Notifications off.'); }
-      if (arg === 'on')  { user.notif_subscribed = true;  persistState(); return await tgSend(chatId, '🔔 Notifications on.'); }
-      return await tgSend(chatId, 'Usage: <code>/notif on</code> or <code>/notif off</code>\nCurrently: '+(user.notif_subscribed?'on':'off'));
+      if (arg === 'off') { user.notif_subscribed = false; persistState(); return await tgSend(chatId, '🔕 notifications off'); }
+      if (arg === 'on')  { user.notif_subscribed = true;  persistState(); return await tgSend(chatId, '🔔 notifications on'); }
+      return await tgSend(chatId, '<code>/notif on</code> or <code>/notif off</code>\nnow: '+(user.notif_subscribed?'on':'off'));
     }
-    return await tgSend(chatId, 'Unknown command. Try /help');
+    return await tgSend(chatId, "didn't catch that. /help");
   }
 
-  // Token recognition takes precedence over pending /new (you might paste a token mid-flow)
   const recog = recognizeToken(text);
   if (recog) {
     clearPending(msg.from.id);
     bindToken(msg.from.id, recog);
-    let body = '✅ Recognized as ' + tierBadge(recog.tier);
-    if (recog.project) body += ' for <code>' + esc(recog.project.name) + '</code>';
-    body += '.\n\nTap below to open the dashboard.';
+    let body = '✅ ' + tierBadge(recog.tier);
+    if (recog.project) body += ' · <code>' + esc(recog.project.name) + '</code>';
+    body += '\n\ntap to open ↓';
     return await tgSend(chatId, body, {
       reply_markup: { inline_keyboard: dashboardKeyboardForBinding({
         tier: recog.tier, token: recog.token, project_name: recog.project?.name,
@@ -525,54 +498,46 @@ async function handleMessage(msg) {
     });
   }
 
-  // If user is in /new wizard, treat this message as the project name input
   if (getPending(msg.from.id)) {
     const v = validateProjectName(text);
     if (!v.ok) {
-      const explain = v.error === 'empty' ? 'Name is empty.'
-        : v.error === 'too_short' ? 'Name is too short (min 2 chars).'
-        : v.error === 'edge_separators' ? 'Name can\'t start or end with <code>-</code> or <code>_</code>.'
-        : 'Invalid name.';
+      const explain = v.error === 'empty' ? "that's empty."
+        : v.error === 'too_short' ? 'too short (min 2 chars).'
+        : v.error === 'edge_separators' ? "can't start/end with <code>-</code> or <code>_</code>."
+        : 'invalid.';
       return await tgSend(chatId,
-        explain + ' Try again, or /cancel.\n\n<i>Allowed: a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.</i>'
+        explain + ' try again or /cancel.\n\n<i>a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.</i>'
       );
     }
-    // Check uniqueness now to fail fast
     if (findProjectByName(v.name)) {
       return await tgSend(chatId,
-        `A project named <code>${esc(v.name)}</code> already exists. Try another, or /cancel.`
+        `<code>${esc(v.name)}</code> is taken. try another or /cancel.`
       );
     }
-    // Valid + unique → show preview with Confirm
-    clearPending(msg.from.id); // pending is consumed; user re-engages via buttons
+    clearPending(msg.from.id);
     return await sendNewPreview(chatId, v.name);
   }
 
-  // Unrecognized text → gentle hint
   await tgSend(chatId,
-    'I didn\'t recognize that.\n\nTry /new to create a project, or paste a <code>pap_…</code> / <code>aap_…</code> token. /help for more.'
+    "didn't catch that.\n\n/new to make one, or paste a <code>pap_…</code> / <code>aap_…</code>"
   );
 }
 
-// /new entry point: with or without name argument
 async function handleNewCommand(chatId, user, requestedName) {
   if (requestedName && requestedName.trim()) {
     const v = validateProjectName(requestedName);
     if (!v.ok) {
-      const explain = v.error === 'too_short' ? 'That name is too short (min 2 chars).'
-        : v.error === 'edge_separators' ? 'Name can\'t start or end with <code>-</code> or <code>_</code>.'
-        : 'That name has invalid characters.';
-      await tgSend(chatId, explain + ' Send /new and pick another.');
+      const explain = v.error === 'too_short' ? 'too short.'
+        : v.error === 'edge_separators' ? "can't start/end with <code>-</code> or <code>_</code>."
+        : 'bad chars.';
+      await tgSend(chatId, explain + ' try /new with another name.');
       return;
     }
     if (findProjectByName(v.name)) {
-      return await tgSend(chatId,
-        `A project named <code>${esc(v.name)}</code> already exists. Send /new and pick another.`
-      );
+      return await tgSend(chatId, `<code>${esc(v.name)}</code> is taken.`);
     }
     return await sendNewPreview(chatId, v.name);
   }
-  // No argument — start wizard
   setPending(user.tg_user_id);
   await sendNewPrompt(chatId);
 }
@@ -583,55 +548,50 @@ async function handleCallback(cq) {
   const user = ensureUser(cq.from);
 
   if (!isAllowed(cq.from, user)) {
-    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Premium required', show_alert: true });
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Premium only', show_alert: true });
     return;
   }
 
-  // forget:<token>
   if (data.startsWith('forget:')) {
     const tok = data.slice(7);
     const ok = unbindToken(cq.from.id, tok);
-    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: ok ? 'Forgotten.' : 'Not found.' });
-    if (ok) await tgSend(chatId, 'Binding removed.');
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: ok ? 'gone.' : 'not found' });
+    if (ok) await tgSend(chatId, 'forgotten.');
     return;
   }
 
-  // new:cancel
   if (data === 'new:cancel') {
     clearPending(cq.from.id);
-    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Cancelled' });
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'cancelled' });
     try { await tgApi('editMessageText', {
       chat_id: chatId, message_id: cq.message.message_id,
-      text: '✕ Cancelled.', parse_mode: 'HTML',
+      text: '✕ cancelled', parse_mode: 'HTML',
     }); } catch (e) {}
     return;
   }
 
-  // new:rename — re-enter wizard
   if (data === 'new:rename') {
     setPending(cq.from.id);
     await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
     try { await tgApi('editMessageText', {
       chat_id: chatId, message_id: cq.message.message_id,
-      text: '✎ Send a new name as your next message.\n\n<i>Allowed: a–z, 0–9, <code>-</code>, <code>_</code>. 2–40 chars.</i>',
+      text: '✏️ send a new name as your next message',
       parse_mode: 'HTML',
     }); } catch (e) {}
     return;
   }
 
-  // new:confirm:<name>
   if (data.startsWith('new:confirm:')) {
     const name = data.slice('new:confirm:'.length);
     const v = validateProjectName(name);
     if (!v.ok) {
-      await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Invalid name', show_alert: true });
+      await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'invalid name', show_alert: true });
       return;
     }
-    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'Creating...' });
-    // Replace the preview with a "creating" stub so the user sees something happen
+    await tgApi('answerCallbackQuery', { callback_query_id: cq.id, text: 'creating...' });
     try { await tgApi('editMessageText', {
       chat_id: chatId, message_id: cq.message.message_id,
-      text: `⏳ Creating <code>${esc(v.name)}</code>...`, parse_mode: 'HTML',
+      text: `⏳ creating <code>${esc(v.name)}</code>...`, parse_mode: 'HTML',
     }); } catch (e) {}
     await actuallyCreateProject(chatId, user, v.name);
     return;
@@ -640,12 +600,8 @@ async function handleCallback(cq) {
   await tgApi('answerCallbackQuery', { callback_query_id: cq.id });
 }
 
-async function sendStart(chatId, user) {
-  await tgSend(chatId, welcomeText(user));
-}
-async function sendHelp(chatId) {
-  await tgSend(chatId, helpText());
-}
+async function sendStart(chatId, user) { await tgSend(chatId, welcomeText(user)); }
+async function sendHelp(chatId) { await tgSend(chatId, helpText()); }
 async function sendProjects(chatId, user) {
   const text = projectsListText(user);
   const kb = (user?.bindings || []).slice(0, 8).flatMap(b => dashboardKeyboardForBinding(b));
@@ -653,13 +609,13 @@ async function sendProjects(chatId, user) {
 }
 async function sendForgetMenu(chatId, user) {
   if (!user || !user.bindings.length) {
-    return await tgSend(chatId, 'Nothing to forget.');
+    return await tgSend(chatId, 'nothing to forget');
   }
   const kb = user.bindings.map(b => [{
-    text: 'Forget ' + tierBadge(b.tier) + (b.project_name ? ' · ' + b.project_name : ''),
+    text: 'forget ' + tierBadge(b.tier) + (b.project_name ? ' · ' + b.project_name : ''),
     callback_data: 'forget:' + b.token,
   }]);
-  await tgSend(chatId, 'Pick a binding to forget:', { reply_markup: { inline_keyboard: kb } });
+  await tgSend(chatId, 'pick one to forget:', { reply_markup: { inline_keyboard: kb } });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -708,24 +664,22 @@ async function refreshBotMe() {
 async function configureBotProfile() {
   if (!TAP || !TAP.token) return;
   const commands = [
-    { command: 'new',      description: 'Create a new project (you become the owner)' },
-    { command: 'projects', description: 'List your projects and open dashboards' },
-    { command: 'help',     description: 'Show available commands' },
-    { command: 'forget',   description: 'Remove a token binding' },
-    { command: 'notif',    description: 'Toggle notifications: /notif on or /notif off' },
-    { command: 'cancel',   description: 'Cancel the current /new flow' },
-    { command: 'start',    description: 'Welcome message' },
+    { command: 'new',      description: 'new project ✨' },
+    { command: 'projects', description: 'your projects' },
+    { command: 'help',     description: 'help' },
+    { command: 'forget',   description: 'drop a token' },
+    { command: 'notif',    description: 'notifications on/off' },
+    { command: 'cancel',   description: 'cancel /new' },
+    { command: 'start',    description: 'welcome' },
   ];
-  const shortDesc = 'Build websites by talking to Claude. Premium-only.';
+  const shortDesc = 'Build by talking to Claude. Premium only.';
   const longDesc =
-    'Drafts Telepath turns Telegram into your control center for building websites with Claude. ' +
-    'Use /new to create a project, then talk to Claude through the Drafts pass-link. ' +
-    'Each version is saved automatically. Telegram Premium required.';
+    'Drafts turns Telegram into your build space. Type /new to create a project, then talk to Claude to build a website, app, or bot. Each version is saved automatically.';
   try {
     await tgApi('setMyCommands', { commands });
     await tgApi('setMyShortDescription', { short_description: shortDesc });
     await tgApi('setMyDescription', { description: longDesc });
-    console.log('[telepath] bot profile configured (commands, short_description, description)');
+    console.log('[telepath] bot profile configured');
   } catch (e) {
     console.error('[telepath] configureBotProfile error:', e.message);
   }
@@ -754,14 +708,14 @@ function notifyPAPOwners(projectName, html) {
 
 function onNewProject(project) {
   if (!telepathState.settings.notify_sap_on_new_project) return;
-  notifySAPOwners(`🆕 New project: <code>${esc(project.name)}</code>`);
+  notifySAPOwners(`🆕 <code>${esc(project.name)}</code>`);
 }
 function onNewAAPCreated(project, aap) {
-  notifyPAPOwners(project.name, `🤝 New agent for <code>${esc(project.name)}</code>: ${esc(aap.name || aap.id)}`);
+  notifyPAPOwners(project.name, `🤝 new agent on <code>${esc(project.name)}</code>: ${esc(aap.name || aap.id)}`);
 }
 function onAAPMerged(project, aap, versionN) {
   if (!telepathState.settings.notify_pap_on_aap_merge) return;
-  notifyPAPOwners(project.name, `✅ Agent ${esc(aap.name || aap.id)} merged into <code>${esc(project.name)}</code>. New version: v${versionN}`);
+  notifyPAPOwners(project.name, `✅ merged into <code>${esc(project.name)}</code> · v${versionN}`);
 }
 function onMainCommit(project, commit, versionN) {
   if (!telepathState.settings.notify_pap_on_main_commit) return;
@@ -773,6 +727,7 @@ function onMainCommit(project, commit, versionN) {
 // HTTP routes
 // ─────────────────────────────────────────────────────────────
 function mountRoutes(app) {
+  // ── TAP management (control bot) ──
   app.get('/drafts/tap', requireSAP, (req, res) => {
     if (!TAP) return res.json({ ok: true, installed: false });
     res.json({ ok: true, installed: true, bot: TAP.bot || null, installed_at: TAP.installed_at || null, polling });
@@ -783,9 +738,8 @@ function mountRoutes(app) {
     if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(token)) {
       return res.status(400).json({ ok: false, error: 'invalid_token_format' });
     }
-    const probe = { token };
     const oldTAP = TAP;
-    TAP = probe;
+    TAP = { token };
     try {
       const me = await tgApi('getMe');
       TAP = { token, bot: { id: me.id, username: me.username, first_name: me.first_name }, installed_at: now() };
@@ -820,10 +774,12 @@ function mountRoutes(app) {
     catch (e) { res.status(500).json({ ok: false, error: e.message }); }
   });
 
+  // ── WebApp pages ──
   app.get('/telepath/app/sap',           (req, res) => res.type('html').send(renderWebAppShell('sap')));
   app.get('/telepath/app/pap/:token',    (req, res) => res.type('html').send(renderWebAppShell('pap', req.params.token)));
   app.get('/telepath/app/aap/:token',    (req, res) => res.type('html').send(renderWebAppShell('aap', req.params.token)));
 
+  // ── WebApp API ──
   app.post('/telepath/api/whoami', initDataAuth, (req, res) => {
     res.json({ ok: true, tg_user: req.tgUser });
   });
@@ -839,6 +795,8 @@ function mountRoutes(app) {
         created_at: p.created_at,
         pap_active: !!(p.pap && !p.pap.revoked),
         aap_count: (p.aaps || []).filter(a => !a.revoked).length,
+        bot_attached: !!(p.bot && p.bot.token),
+        bot_username: p.bot?.bot_username || null,
       }));
       return res.json({ ok: true, tier: 'sap', server_number: SERVER_NUMBER, public_base: PUBLIC_BASE, projects, settings: telepathState.settings });
     }
@@ -852,6 +810,7 @@ function mountRoutes(app) {
         created_at: p.created_at, live_url: PUBLIC_BASE + '/' + p.name + '/',
         pass_url: PUBLIC_BASE + '/drafts/pass/drafts_project_' + SERVER_NUMBER + '_' + token.replace(/^pap_/,''),
         aaps: (p.aaps || []).map(a => ({ id: a.id, name: a.name, revoked: a.revoked, branch: a.branch })),
+        bot: projectBotsApi.getBotStatus(p),
       }});
     }
     if (tier === 'aap') {
@@ -904,6 +863,76 @@ function mountRoutes(app) {
     const ok = unbindToken(req.tgUser.id, tok);
     res.json({ ok, removed: ok });
   });
+
+  // ── Project Bots (per-PAP) ──
+  // helper: load project by PAP token, verify caller owns it
+  function papOwnerCheck(req, res) {
+    const u = getUser(req.tgUser.id);
+    const token = String(req.body.pap_token || req.query.pap_token || '');
+    if (!u || !u.bindings.some(b => b.token === token && b.tier === 'pap')) {
+      res.status(403).json({ ok: false, error: 'not_bound' });
+      return null;
+    }
+    const p = findProjectByPAP(token);
+    if (!p) {
+      res.status(404).json({ ok: false, error: 'project_not_found' });
+      return null;
+    }
+    return p;
+  }
+
+  app.get('/telepath/api/pap/bot', initDataAuth, (req, res) => {
+    const p = papOwnerCheck(req, res);
+    if (!p) return;
+    res.json({ ok: true, bot: projectBotsApi.getBotStatus(p) });
+  });
+
+  app.put('/telepath/api/pap/bot', initDataAuth, async (req, res) => {
+    const p = papOwnerCheck(req, res);
+    if (!p) return;
+    const botToken = String(req.body.bot_token || '').trim();
+    if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(botToken)) {
+      return res.status(400).json({ ok: false, error: 'invalid_bot_token_format' });
+    }
+    try {
+      const out = await projectBotsApi.installBot(p, botToken);
+      res.json({ ok: true, bot: out });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.delete('/telepath/api/pap/bot', initDataAuth, async (req, res) => {
+    const p = papOwnerCheck(req, res);
+    if (!p) return;
+    try {
+      const out = await projectBotsApi.unlinkBot(p, { notify_subscribers: false });
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  app.post('/telepath/api/pap/bot/sync', initDataAuth, async (req, res) => {
+    const p = papOwnerCheck(req, res);
+    if (!p) return;
+    const message = String(req.body.message || '').trim();
+    // If user provided a message, append the viral attribution line
+    let html = null;
+    if (message) {
+      const ctrlBot = getControlBotUsername();
+      const attribution = ctrlBot
+        ? `\n\n<i>Built with Drafts → @${esc(ctrlBot)}</i>`
+        : '\n\n<i>Built with Drafts</i>';
+      html = esc(message).replace(/\n/g, '\n') + attribution;
+    }
+    try {
+      const out = await projectBotsApi.syncBot(p, html);
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -926,42 +955,52 @@ function initDataAuth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WebApp shell HTML (unchanged)
+// WebApp shell HTML — Gen Z'd: tighter copy, cleaner cards, bot section
 // ─────────────────────────────────────────────────────────────
 function renderWebAppShell(tier, token) {
   const stateUrl = '/telepath/api/state/' + tier + (token ? '/' + token : '');
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Drafts Telepath</title>
+<title>Drafts</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root { color-scheme: dark light; }
-body { margin:0; padding:0; background: var(--tg-theme-bg-color, #000); color: var(--tg-theme-text-color, #f5f5f5); font-family: Inter, system-ui, -apple-system, sans-serif; font-size:15px; line-height:1.5; }
+body { margin:0; padding:0; background: var(--tg-theme-bg-color, #000); color: var(--tg-theme-text-color, #f5f5f5); font-family: Inter, -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size:15px; line-height:1.5; }
 .wrap { max-width: 600px; margin: 0 auto; padding: 16px 18px 80px; }
-h1 { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; margin: 4px 0 4px; }
-.sub { color: var(--tg-theme-hint-color, #888); font-size: 13px; margin-bottom: 18px; }
-.card { background: var(--tg-theme-secondary-bg-color, #111); border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
-.card h3 { font-size:11px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color: var(--tg-theme-hint-color, #888); margin:0 0 10px; }
-.row { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom: 1px solid rgba(255,255,255,0.06); font-size:13px; }
+h1 { font-size: 26px; font-weight: 800; letter-spacing: -0.025em; margin: 4px 0 4px; }
+.sub { color: var(--tg-theme-hint-color, #888); font-size: 13px; margin-bottom: 20px; }
+.card { background: var(--tg-theme-secondary-bg-color, #111); border-radius: 14px; padding: 16px 18px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.04); }
+.card h3 { font-size:11px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color: var(--tg-theme-hint-color, #888); margin:0 0 12px; display:flex; align-items:center; gap:6px; }
+.card h3 .dot { display:inline-block; width:6px; height:6px; border-radius:50%; }
+.card h3 .dot.on { background:#4ade80; }
+.card h3 .dot.off { background:#666; }
+.row { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size:13px; }
 .row:last-child { border-bottom:none; }
 .row .k { color: var(--tg-theme-hint-color, #888); flex-shrink:0; }
 .row .v { text-align:right; word-break:break-all; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
-.btn { display:inline-block; padding:10px 16px; border-radius:10px; background: var(--tg-theme-button-color, #ea5a2e); color: var(--tg-theme-button-text-color, #fff); text-decoration:none; font-weight:600; font-size:14px; border:none; cursor:pointer; font-family:inherit; }
-.btn.ghost { background: transparent; color: var(--tg-theme-link-color, #60a5fa); border: 1px solid rgba(96,165,250,0.3); }
+.btn { display:inline-block; padding:11px 18px; border-radius:12px; background: var(--tg-theme-button-color, #ea5a2e); color: var(--tg-theme-button-text-color, #fff); text-decoration:none; font-weight:700; font-size:14px; border:none; cursor:pointer; font-family:inherit; }
+.btn:active { transform: scale(0.97); }
+.btn.ghost { background: transparent; color: var(--tg-theme-link-color, #60a5fa); border: 1.5px solid rgba(96,165,250,0.3); }
+.btn.danger { background: transparent; color: #ef4444; border: 1.5px solid rgba(239,68,68,0.3); }
 .btn + .btn { margin-left: 8px; }
-.muted { color: var(--tg-theme-hint-color, #888); font-size:12px; }
-input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.12); background: var(--tg-theme-bg-color, #000); color: inherit; font-family:inherit; font-size:14px; box-sizing:border-box; margin-bottom:8px; }
-.proj-item { padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.06); }
+.btn.full { width:100%; display:block; text-align:center; }
+.muted { color: var(--tg-theme-hint-color, #888); font-size:12px; line-height:1.55; }
+input, textarea { width:100%; padding:12px 14px; border-radius:10px; border:1.5px solid rgba(255,255,255,0.1); background: var(--tg-theme-bg-color, #000); color: inherit; font-family:inherit; font-size:14px; box-sizing:border-box; margin-bottom:8px; }
+input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-color, #ea5a2e); }
+.proj-item { padding:12px 0; border-bottom:1px solid rgba(255,255,255,0.05); }
 .proj-item:last-child { border-bottom:none; }
-.proj-name { font-weight:700; font-size:14px; }
-.proj-meta { font-size:12px; color: var(--tg-theme-hint-color, #888); margin-top:2px; }
-.empty { padding: 24px 0; text-align:center; color: var(--tg-theme-hint-color, #888); }
-.toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#222; color:#fff; padding:10px 16px; border-radius:8px; font-size:13px; z-index:100; }
+.proj-name { font-weight:700; font-size:15px; }
+.proj-meta { font-size:12px; color: var(--tg-theme-hint-color, #888); margin-top:3px; }
+.empty { padding: 28px 0; text-align:center; color: var(--tg-theme-hint-color, #888); font-size:13px; }
+.toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#222; color:#fff; padding:11px 18px; border-radius:10px; font-size:13px; z-index:100; box-shadow:0 4px 20px rgba(0,0,0,0.4); }
+.actions { display:flex; gap:10px; flex-wrap:wrap; }
+.bot-status { display:flex; align-items:center; gap:10px; padding:6px 0 14px; }
+.bot-status .badge { font-size:13px; font-weight:600; color:#f5f5f5; }
+.bot-status .meta { font-size:12px; color: var(--tg-theme-hint-color, #888); }
+.help-block { background:rgba(96,165,250,0.06); border-left:3px solid #60a5fa; padding:10px 12px; border-radius:6px; font-size:12.5px; color:#a8a8a8; margin:8px 0; line-height:1.5; }
 </style>
-</head><body><div class="wrap" id="root">
-  <div class="empty">Loading…</div>
-</div>
+</head><body><div class="wrap" id="root"><div class="empty">loading…</div></div>
 <script>
 (function(){
   const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
@@ -973,7 +1012,7 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
   const STATE_URL = ${JSON.stringify(stateUrl)};
 
   function toast(msg){ const t=document.createElement('div'); t.className='toast'; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2400); }
-  function copy(text){ navigator.clipboard.writeText(text).then(()=>toast('Copied')); }
+  function copy(text){ navigator.clipboard.writeText(text).then(()=>toast('copied ✓')); }
   function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
   async function api(method, url, body) {
@@ -987,7 +1026,7 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
 
   async function load(){
     if (!initData) {
-      root.innerHTML = '<div class="card"><h3>Open this from Telegram</h3><div class="muted">This page only works inside the Telegram WebApp. Open it via the bot.</div></div>';
+      root.innerHTML = '<div class="card"><h3>open from telegram</h3><div class="muted">this only works inside the telegram app. open it via the bot.</div></div>';
       return;
     }
     try {
@@ -996,79 +1035,162 @@ input, textarea { width:100%; padding:10px 12px; border-radius:8px; border:1px s
       if (data.tier === 'pap') return renderPAP(data);
       if (data.tier === 'aap') return renderAAP(data);
     } catch (e) {
-      root.innerHTML = '<div class="card"><h3>Error</h3><div class="muted">'+esc(e.message)+'</div></div>';
+      root.innerHTML = '<div class="card"><h3>error</h3><div class="muted">'+esc(e.message)+'</div></div>';
     }
   }
 
   function renderSAP(d) {
-    let h = '<h1>Server admin</h1><div class="sub">Server #'+d.server_number+' · '+esc(d.public_base.replace(/^https?:\\/\\//,''))+'</div>';
-    h += '<div class="card"><h3>New project</h3>';
-    h += '<input id="newName" placeholder="project-name (a-z, 0-9, -, _)" maxlength="40"/>';
+    let h = '<h1>server</h1><div class="sub">'+esc(d.public_base.replace(/^https?:\\/\\//,''))+' · #'+d.server_number+'</div>';
+    h += '<div class="card"><h3>new project</h3>';
+    h += '<input id="newName" placeholder="project-name" maxlength="40"/>';
     h += '<input id="newDesc" placeholder="description (optional)"/>';
-    h += '<button class="btn" id="createBtn">Create project</button></div>';
-    h += '<div class="card"><h3>Projects ('+d.projects.length+')</h3>';
-    if (!d.projects.length) h += '<div class="empty">No projects yet</div>';
+    h += '<button class="btn full" id="createBtn">create ✨</button></div>';
+    h += '<div class="card"><h3>projects · '+d.projects.length+'</h3>';
+    if (!d.projects.length) h += '<div class="empty">no projects yet</div>';
     for (const p of d.projects) {
+      const botBadge = p.bot_attached ? ' · 🤖 @'+esc(p.bot_username||'bot') : '';
       h += '<div class="proj-item"><div class="proj-name">'+esc(p.name)+'</div>';
-      h += '<div class="proj-meta">'+(p.description ? esc(p.description)+' · ' : '')+'AAPs: '+p.aap_count+' · '+(p.pap_active?'PAP active':'PAP revoked')+'</div></div>';
+      h += '<div class="proj-meta">'+(p.description ? esc(p.description)+' · ' : '')+'agents: '+p.aap_count+botBadge+'</div></div>';
     }
     h += '</div>';
     root.innerHTML = h;
     document.getElementById('createBtn').addEventListener('click', async () => {
       const name = document.getElementById('newName').value.trim();
       const description = document.getElementById('newDesc').value.trim();
-      if (!name) { toast('Name required'); return; }
+      if (!name) { toast('name required'); return; }
       try {
         await api('POST', '/telepath/api/sap/projects', { name, description });
-        toast('Created');
+        toast('created ✓');
         setTimeout(load, 600);
-      } catch (e) { toast('Failed: '+e.message); }
+      } catch (e) { toast('failed: '+e.message); }
     });
   }
 
   function renderPAP(d) {
     const p = d.project;
-    let h = '<h1>'+esc(p.name)+'</h1><div class="sub">Project · '+esc(d.public_base.replace(/^https?:\\/\\//,''))+'</div>';
-    h += '<div class="card"><h3>Build</h3>';
-    h += '<div class="muted" style="margin-bottom:10px">Open the pass-link in Claude (Chrome extension or claude.ai) to start building.</div>';
-    h += '<button class="btn" id="copyPass">Copy pass-link</button>';
-    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">Open live ↗</a>';
+    let h = '<h1>'+esc(p.name)+'</h1><div class="sub">project on '+esc(d.public_base.replace(/^https?:\\/\\//,''))+'</div>';
+
+    // Live + Pass-link actions
+    h += '<div class="card"><h3>your project</h3>';
+    h += '<div class="actions">';
+    h += '<a class="btn" href="'+p.live_url+'" target="_blank">🌐 live</a>';
+    h += '<button class="btn ghost" id="copyPass">🔗 pass-link</button>';
     h += '</div>';
-    h += '<div class="card"><h3>Agents (AAP)</h3>';
-    if (!p.aaps.length) h += '<div class="empty muted">No agents yet</div>';
+    h += '<div class="muted" style="margin-top:10px">pass-link is what you share with Claude to build. tap to copy.</div>';
+    h += '</div>';
+
+    // Bot card
+    h += '<div class="card" id="botCard"><h3><span class="dot '+(p.bot.installed?'on':'off')+'"></span>telegram bot</h3>';
+    if (p.bot.installed) {
+      h += '<div class="bot-status"><div><div class="badge">@'+esc(p.bot.bot_username||'bot')+'</div>';
+      h += '<div class="meta">'+p.bot.subscriber_count+' subscriber'+(p.bot.subscriber_count===1?'':'s');
+      if (p.bot.last_synced_at) h += ' · synced '+new Date(p.bot.last_synced_at).toLocaleDateString();
+      else h += ' · not synced yet';
+      h += '</div></div></div>';
+      h += '<div class="actions">';
+      h += '<button class="btn" id="syncBtn">↻ update bot</button>';
+      h += '<button class="btn danger" id="unlinkBtn">unlink</button>';
+      h += '</div>';
+      h += '<div class="help-block">tap <b>update bot</b> to push latest project info + send a broadcast to subscribers. by default the bot does <b>not</b> auto-update so users don\\'t get spammed.</div>';
+    } else {
+      h += '<div class="muted" style="margin-bottom:12px">turn your project into a telegram bot. users tap to open your project as a mini-app.</div>';
+      h += '<input id="botToken" placeholder="paste bot token from @BotFather" type="password" autocomplete="off"/>';
+      h += '<button class="btn full" id="linkBtn">🔗 link bot</button>';
+      h += '<div class="help-block">need a bot? open <a href="https://t.me/BotFather" target="_blank" style="color:#60a5fa">@BotFather</a> → /newbot → follow the steps → copy the token here.</div>';
+    }
+    h += '</div>';
+
+    // Agents
+    h += '<div class="card"><h3>agents · '+p.aaps.length+'</h3>';
+    if (!p.aaps.length) h += '<div class="empty">no agents yet</div>';
     for (const a of p.aaps) {
-      h += '<div class="proj-item"><div class="proj-name">'+esc(a.name||a.id)+(a.revoked?' (revoked)':'')+'</div>';
+      h += '<div class="proj-item"><div class="proj-name">'+esc(a.name||a.id)+(a.revoked?' <span style="color:#ef4444">(revoked)</span>':'')+'</div>';
       h += '<div class="proj-meta">branch: '+esc(a.branch)+'</div></div>';
     }
     h += '<div style="margin-top:12px"><input id="aapName" placeholder="agent name (optional)" maxlength="60"/>';
-    h += '<button class="btn" id="newAap">Generate agent link</button></div>';
+    h += '<button class="btn full" id="newAap">+ invite agent</button></div>';
     h += '</div>';
-    h += '<div class="card"><h3>Project info</h3>';
+
+    // Info
+    h += '<div class="card"><h3>info</h3>';
     h += '<div class="row"><span class="k">created</span><span class="v">'+esc(p.created_at.slice(0,10))+'</span></div>';
     if (p.github_repo) h += '<div class="row"><span class="k">github</span><span class="v">'+esc(p.github_repo)+'</span></div>';
-    h += '<div class="row"><span class="k">description</span><span class="v">'+esc(p.description||'—')+'</span></div>';
+    h += '<div class="row"><span class="k">about</span><span class="v">'+esc(p.description||'—')+'</span></div>';
     h += '</div>';
+
     root.innerHTML = h;
+
     document.getElementById('copyPass').addEventListener('click', () => copy(p.pass_url));
     document.getElementById('newAap').addEventListener('click', async () => {
       const name = document.getElementById('aapName').value.trim();
       try {
         const out = await api('POST', '/telepath/api/pap/aaps', { pap_token: TOKEN, name });
         copy(out.activation_url);
-        toast('Agent link copied');
+        toast('agent link copied ✓');
         setTimeout(load, 600);
-      } catch (e) { toast('Failed: '+e.message); }
+      } catch (e) { toast('failed: '+e.message); }
     });
+
+    if (p.bot.installed) {
+      document.getElementById('syncBtn').addEventListener('click', () => openBroadcastModal());
+      document.getElementById('unlinkBtn').addEventListener('click', async () => {
+        if (!confirm('unlink @'+(p.bot.bot_username||'bot')+'? subscribers will stop receiving updates.')) return;
+        try {
+          await api('DELETE', '/telepath/api/pap/bot?pap_token='+encodeURIComponent(TOKEN));
+          toast('unlinked ✓');
+          setTimeout(load, 500);
+        } catch (e) { toast('failed: '+e.message); }
+      });
+    } else {
+      document.getElementById('linkBtn').addEventListener('click', async () => {
+        const token = document.getElementById('botToken').value.trim();
+        if (!token) { toast('paste a token first'); return; }
+        try {
+          const out = await api('PUT', '/telepath/api/pap/bot', { pap_token: TOKEN, bot_token: token });
+          toast('linked: @'+out.bot.bot_username);
+          setTimeout(load, 600);
+        } catch (e) { toast('failed: '+e.message); }
+      });
+    }
+  }
+
+  function openBroadcastModal() {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:flex;align-items:flex-end;justify-content:center;';
+    overlay.innerHTML = ''+
+      '<div style="background:#181818;width:100%;max-width:600px;border-radius:16px 16px 0 0;padding:20px 18px 28px;">'+
+        '<div style="font-size:18px;font-weight:800;margin-bottom:6px">update bot</div>'+
+        '<div class="muted" style="margin-bottom:14px">syncs the bot\\'s name, description, and menu button to your project. optionally send a message to subscribers.</div>'+
+        '<textarea id="bcMsg" rows="3" placeholder="what\\'s new? 👀  (leave empty to skip broadcast)"></textarea>'+
+        '<button class="btn full" id="bcSend">↻ update bot</button>'+
+        '<button class="btn ghost full" id="bcCancel" style="margin-top:8px">cancel</button>'+
+      '</div>';
+    document.body.appendChild(overlay);
+    document.getElementById('bcCancel').onclick = () => overlay.remove();
+    document.getElementById('bcSend').onclick = async () => {
+      const message = document.getElementById('bcMsg').value.trim();
+      try {
+        const out = await api('POST', '/telepath/api/pap/bot/sync', { pap_token: TOKEN, message });
+        if (out.broadcast && !out.broadcast.skipped) {
+          toast('synced + sent to '+out.broadcast.sent);
+        } else {
+          toast('synced ✓');
+        }
+        overlay.remove();
+        setTimeout(load, 600);
+      } catch (e) { toast('failed: '+e.message); }
+    };
   }
 
   function renderAAP(d) {
     const p = d.project;
-    let h = '<h1>'+esc(p.name)+'</h1><div class="sub">Agent: '+esc(d.aap.name||d.aap.id)+'</div>';
-    h += '<div class="card"><h3>Build in your branch</h3>';
-    h += '<div class="muted" style="margin-bottom:10px">Open this pass-link in Claude to start contributing. Your work goes to '+esc(d.aap.branch)+'.</div>';
-    h += '<button class="btn" id="copyPass">Copy pass-link</button>';
-    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">View live ↗</a>';
-    h += '</div>';
+    let h = '<h1>'+esc(p.name)+'</h1><div class="sub">agent: '+esc(d.aap.name||d.aap.id)+'</div>';
+    h += '<div class="card"><h3>your branch</h3>';
+    h += '<div class="muted" style="margin-bottom:10px">open this pass-link in Claude. your work goes to <code>'+esc(d.aap.branch)+'</code>.</div>';
+    h += '<div class="actions">';
+    h += '<button class="btn" id="copyPass">🔗 pass-link</button>';
+    h += '<a class="btn ghost" href="'+p.live_url+'" target="_blank">🌐 live</a>';
+    h += '</div></div>';
     root.innerHTML = h;
     document.getElementById('copyPass').addEventListener('click', () => copy(d.pass_url));
   }
