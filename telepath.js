@@ -1,10 +1,12 @@
 // telepath.js — Drafts Telepath: control-plane Telegram bot for Drafts servers.
 //
-// v0.5: project bots integration. Each PAP project can attach its own
-// Telegram bot via the PAP WebApp dashboard. Project bots are managed
-// by the project-bots.js module (independent long-pollers, profile sync,
-// broadcast). This file exposes the management endpoints and renders
-// the WebApp UI for them.
+// v0.6: webhook forwarder mode. Each PAP project can attach a Telegram bot
+// that operates in one of two modes:
+//   - default mode: built-in /start, /stop, broadcast (v0.5 behavior)
+//   - webhook mode: Telegram updates forwarded to user's URL (Vercel/CF/etc)
+//
+// The PAP WebApp dashboard now includes a webhook URL input and a viewer
+// for the last 20 forward calls (status code, latency, error).
 
 import fs from 'fs';
 import fsp from 'fs/promises';
@@ -115,7 +117,6 @@ function persistTAP() {
   }
 }
 
-// Public getter so project-bots.js can append "Built with Drafts → @<username>" to its messages
 export function getControlBotUsername() {
   return TAP && TAP.bot ? TAP.bot.username : null;
 }
@@ -797,6 +798,7 @@ function mountRoutes(app) {
         aap_count: (p.aaps || []).filter(a => !a.revoked).length,
         bot_attached: !!(p.bot && p.bot.token),
         bot_username: p.bot?.bot_username || null,
+        bot_mode: p.bot?.webhook_url ? 'webhook' : (p.bot ? 'default' : null),
       }));
       return res.json({ ok: true, tier: 'sap', server_number: SERVER_NUMBER, public_base: PUBLIC_BASE, projects, settings: telepathState.settings });
     }
@@ -865,7 +867,6 @@ function mountRoutes(app) {
   });
 
   // ── Project Bots (per-PAP) ──
-  // helper: load project by PAP token, verify caller owns it
   function papOwnerCheck(req, res) {
     const u = getUser(req.tgUser.id);
     const token = String(req.body.pap_token || req.query.pap_token || '');
@@ -887,6 +888,7 @@ function mountRoutes(app) {
     res.json({ ok: true, bot: projectBotsApi.getBotStatus(p) });
   });
 
+  // PUT bot — install (now also accepts optional webhook_url for one-shot install + webhook setup)
   app.put('/telepath/api/pap/bot', initDataAuth, async (req, res) => {
     const p = papOwnerCheck(req, res);
     if (!p) return;
@@ -894,8 +896,9 @@ function mountRoutes(app) {
     if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(botToken)) {
       return res.status(400).json({ ok: false, error: 'invalid_bot_token_format' });
     }
+    const webhookUrl = req.body.webhook_url ? String(req.body.webhook_url).trim() : null;
     try {
-      const out = await projectBotsApi.installBot(p, botToken);
+      const out = await projectBotsApi.installBot(p, botToken, { webhook_url: webhookUrl });
       res.json({ ok: true, bot: out });
     } catch (e) {
       res.status(400).json({ ok: false, error: e.message });
@@ -913,11 +916,25 @@ function mountRoutes(app) {
     }
   });
 
+  // PATCH webhook — set/clear/change webhook URL without re-installing
+  app.patch('/telepath/api/pap/bot/webhook', initDataAuth, async (req, res) => {
+    const p = papOwnerCheck(req, res);
+    if (!p) return;
+    if (!p.bot || !p.bot.token) return res.status(400).json({ ok: false, error: 'no_bot_installed' });
+    const url = req.body.webhook_url;
+    try {
+      // url === null or "" → clear; otherwise validate & set
+      const out = await projectBotsApi.setWebhookUrl(p, url == null || url === '' ? null : String(url).trim());
+      res.json({ ok: true, ...out });
+    } catch (e) {
+      res.status(400).json({ ok: false, error: e.message });
+    }
+  });
+
   app.post('/telepath/api/pap/bot/sync', initDataAuth, async (req, res) => {
     const p = papOwnerCheck(req, res);
     if (!p) return;
     const message = String(req.body.message || '').trim();
-    // If user provided a message, append the viral attribution line
     let html = null;
     if (message) {
       const ctrlBot = getControlBotUsername();
@@ -955,7 +972,7 @@ function initDataAuth(req, res, next) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// WebApp shell HTML — Gen Z'd: tighter copy, cleaner cards, bot section
+// WebApp shell HTML — Gen Z'd, with v0.6 webhook section
 // ─────────────────────────────────────────────────────────────
 function renderWebAppShell(tier, token) {
   const stateUrl = '/telepath/api/state/' + tier + (token ? '/' + token : '');
@@ -999,6 +1016,16 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
 .bot-status .badge { font-size:13px; font-weight:600; color:#f5f5f5; }
 .bot-status .meta { font-size:12px; color: var(--tg-theme-hint-color, #888); }
 .help-block { background:rgba(96,165,250,0.06); border-left:3px solid #60a5fa; padding:10px 12px; border-radius:6px; font-size:12.5px; color:#a8a8a8; margin:8px 0; line-height:1.5; }
+.mode-pill { display:inline-block; padding:3px 9px; border-radius:99px; font-size:10.5px; font-weight:700; letter-spacing:0.05em; text-transform:uppercase; }
+.mode-pill.webhook { background:rgba(139,92,246,0.15); color:#a78bfa; }
+.mode-pill.default { background:rgba(96,165,250,0.15); color:#60a5fa; }
+.log-table { width:100%; border-collapse:collapse; margin-top:8px; font-size:11.5px; font-family: ui-monospace, Menlo, monospace; }
+.log-table td { padding:5px 6px; border-bottom:1px solid rgba(255,255,255,0.04); vertical-align:top; }
+.log-table .log-status { font-weight:700; }
+.log-status.ok { color:#4ade80; }
+.log-status.err { color:#ef4444; }
+.log-time { color:#888; }
+.divider { height:1px; background:rgba(255,255,255,0.06); margin:14px 0; }
 </style>
 </head><body><div class="wrap" id="root"><div class="empty">loading…</div></div>
 <script>
@@ -1014,6 +1041,14 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
   function toast(msg){ const t=document.createElement('div'); t.className='toast'; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2400); }
   function copy(text){ navigator.clipboard.writeText(text).then(()=>toast('copied ✓')); }
   function esc(s){ if(s==null) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+  function timeAgo(iso) {
+    if (!iso) return '—';
+    const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s/60) + 'm ago';
+    if (s < 86400) return Math.floor(s/3600) + 'h ago';
+    return Math.floor(s/86400) + 'd ago';
+  }
 
   async function api(method, url, body) {
     const opts = { method, headers: { 'Content-Type':'application/json', 'X-Telegram-Init-Data': initData } };
@@ -1048,7 +1083,11 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
     h += '<div class="card"><h3>projects · '+d.projects.length+'</h3>';
     if (!d.projects.length) h += '<div class="empty">no projects yet</div>';
     for (const p of d.projects) {
-      const botBadge = p.bot_attached ? ' · 🤖 @'+esc(p.bot_username||'bot') : '';
+      let botBadge = '';
+      if (p.bot_attached) {
+        const modeLabel = p.bot_mode === 'webhook' ? '🔌' : '📢';
+        botBadge = ' · '+modeLabel+' @'+esc(p.bot_username||'bot');
+      }
       h += '<div class="proj-item"><div class="proj-name">'+esc(p.name)+'</div>';
       h += '<div class="proj-meta">'+(p.description ? esc(p.description)+' · ' : '')+'agents: '+p.aap_count+botBadge+'</div></div>';
     }
@@ -1082,21 +1121,72 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
     // Bot card
     h += '<div class="card" id="botCard"><h3><span class="dot '+(p.bot.installed?'on':'off')+'"></span>telegram bot</h3>';
     if (p.bot.installed) {
-      h += '<div class="bot-status"><div><div class="badge">@'+esc(p.bot.bot_username||'bot')+'</div>';
-      h += '<div class="meta">'+p.bot.subscriber_count+' subscriber'+(p.bot.subscriber_count===1?'':'s');
-      if (p.bot.last_synced_at) h += ' · synced '+new Date(p.bot.last_synced_at).toLocaleDateString();
-      else h += ' · not synced yet';
+      const mode = p.bot.mode || 'default';
+      h += '<div class="bot-status"><div>';
+      h += '<div class="badge">@'+esc(p.bot.bot_username||'bot')+' <span class="mode-pill '+mode+'" style="margin-left:6px">'+mode+'</span></div>';
+      h += '<div class="meta">';
+      if (mode === 'webhook') {
+        const total = (p.bot.webhook_log || []).length;
+        const recentOk = (p.bot.webhook_log || []).filter(e => e.status >= 200 && e.status < 300).length;
+        h += 'forwarding to your URL · '+recentOk+'/'+total+' ok';
+      } else {
+        h += p.bot.subscriber_count+' subscriber'+(p.bot.subscriber_count===1?'':'s');
+      }
+      if (p.bot.last_synced_at) h += ' · synced '+timeAgo(p.bot.last_synced_at);
       h += '</div></div></div>';
-      h += '<div class="actions">';
-      h += '<button class="btn" id="syncBtn">↻ update bot</button>';
-      h += '<button class="btn danger" id="unlinkBtn">unlink</button>';
-      h += '</div>';
-      h += '<div class="help-block">tap <b>update bot</b> to push latest project info + send a broadcast to subscribers. by default the bot does <b>not</b> auto-update so users don\\'t get spammed.</div>';
+
+      // Webhook URL editor
+      h += '<div class="divider"></div>';
+      h += '<div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#888;margin-bottom:8px">🔌 webhook</div>';
+      if (mode === 'webhook') {
+        h += '<input id="webhookInput" value="'+esc(p.bot.webhook_url)+'" placeholder="https://your-bot.vercel.app/webhook"/>';
+        h += '<div class="actions">';
+        h += '<button class="btn ghost" id="webhookSaveBtn">↻ update url</button>';
+        h += '<button class="btn danger" id="webhookClearBtn">switch to default mode</button>';
+        h += '</div>';
+        // Log table
+        if ((p.bot.webhook_log || []).length) {
+          h += '<div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#888;margin:14px 0 6px">recent calls</div>';
+          h += '<table class="log-table">';
+          for (const e of p.bot.webhook_log.slice(0, 10)) {
+            const okClass = (e.status >= 200 && e.status < 300) ? 'ok' : 'err';
+            const statusText = e.status > 0 ? String(e.status) : (e.error || 'err');
+            h += '<tr><td class="log-time">'+timeAgo(e.at)+'</td>';
+            h += '<td class="log-status '+okClass+'">'+esc(statusText)+'</td>';
+            h += '<td>'+e.latency_ms+'ms</td></tr>';
+          }
+          h += '</table>';
+        } else {
+          h += '<div class="muted" style="margin-top:8px">no calls yet. when telegram sends an update, it\\'ll show here.</div>';
+        }
+      } else {
+        h += '<input id="webhookInput" placeholder="https://your-bot.vercel.app/webhook"/>';
+        h += '<button class="btn full" id="webhookSaveBtn">🔌 enable webhook mode</button>';
+        h += '<div class="help-block">webhook mode = drafts forwards every telegram update to your URL. you host your bot logic anywhere (vercel, cloudflare workers, render — all free), and reply to telegram from there using your own bot token.<br><br>your webhook should respond to a POST with <code>{"ok": true}</code>. timeout: 5s. retries once.</div>';
+      }
+
+      // Default mode actions
+      if (mode === 'default') {
+        h += '<div class="divider"></div>';
+        h += '<div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#888;margin-bottom:8px">📢 default mode</div>';
+        h += '<div class="actions">';
+        h += '<button class="btn" id="syncBtn">↻ update bot</button>';
+        h += '<button class="btn danger" id="unlinkBtn">unlink</button>';
+        h += '</div>';
+        h += '<div class="help-block">tap <b>update bot</b> to push project info + send broadcast to subscribers.</div>';
+      } else {
+        h += '<div class="divider"></div>';
+        h += '<div class="actions">';
+        h += '<button class="btn ghost" id="syncBtn">↻ resync profile</button>';
+        h += '<button class="btn danger" id="unlinkBtn">unlink</button>';
+        h += '</div>';
+      }
     } else {
-      h += '<div class="muted" style="margin-bottom:12px">turn your project into a telegram bot. users tap to open your project as a mini-app.</div>';
+      h += '<div class="muted" style="margin-bottom:12px">turn your project into a telegram bot. either as a mini-app shell, or wire it to your own webhook for full custom logic.</div>';
       h += '<input id="botToken" placeholder="paste bot token from @BotFather" type="password" autocomplete="off"/>';
+      h += '<input id="botWebhookOptional" placeholder="webhook URL (optional — set later)" autocomplete="off"/>';
       h += '<button class="btn full" id="linkBtn">🔗 link bot</button>';
-      h += '<div class="help-block">need a bot? open <a href="https://t.me/BotFather" target="_blank" style="color:#60a5fa">@BotFather</a> → /newbot → follow the steps → copy the token here.</div>';
+      h += '<div class="help-block">need a bot? open <a href="https://t.me/BotFather" target="_blank" style="color:#60a5fa">@BotFather</a> → /newbot → copy the token here. webhook URL is optional — you can set it later.</div>';
     }
     h += '</div>';
 
@@ -1132,21 +1222,48 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
     });
 
     if (p.bot.installed) {
-      document.getElementById('syncBtn').addEventListener('click', () => openBroadcastModal());
+      document.getElementById('syncBtn').addEventListener('click', () => openBroadcastModal(p.bot.mode));
       document.getElementById('unlinkBtn').addEventListener('click', async () => {
-        if (!confirm('unlink @'+(p.bot.bot_username||'bot')+'? subscribers will stop receiving updates.')) return;
+        if (!confirm('unlink @'+(p.bot.bot_username||'bot')+'? '+(p.bot.mode==='webhook'?'updates will stop forwarding to your URL.':'subscribers will stop receiving updates.'))) return;
         try {
           await api('DELETE', '/telepath/api/pap/bot?pap_token='+encodeURIComponent(TOKEN));
           toast('unlinked ✓');
           setTimeout(load, 500);
         } catch (e) { toast('failed: '+e.message); }
       });
+      // Webhook controls (present in both modes)
+      const wsBtn = document.getElementById('webhookSaveBtn');
+      if (wsBtn) {
+        wsBtn.addEventListener('click', async () => {
+          const url = document.getElementById('webhookInput').value.trim();
+          if (!url) { toast('paste a URL first'); return; }
+          try {
+            await api('PATCH', '/telepath/api/pap/bot/webhook', { pap_token: TOKEN, webhook_url: url });
+            toast(p.bot.mode === 'webhook' ? 'url updated ✓' : 'webhook on ✓');
+            setTimeout(load, 600);
+          } catch (e) { toast('failed: '+e.message); }
+        });
+      }
+      const wcBtn = document.getElementById('webhookClearBtn');
+      if (wcBtn) {
+        wcBtn.addEventListener('click', async () => {
+          if (!confirm('switch off webhook mode? drafts will handle /start, /stop, broadcast again.')) return;
+          try {
+            await api('PATCH', '/telepath/api/pap/bot/webhook', { pap_token: TOKEN, webhook_url: null });
+            toast('switched to default ✓');
+            setTimeout(load, 500);
+          } catch (e) { toast('failed: '+e.message); }
+        });
+      }
     } else {
       document.getElementById('linkBtn').addEventListener('click', async () => {
         const token = document.getElementById('botToken').value.trim();
+        const webhook = document.getElementById('botWebhookOptional').value.trim();
         if (!token) { toast('paste a token first'); return; }
         try {
-          const out = await api('PUT', '/telepath/api/pap/bot', { pap_token: TOKEN, bot_token: token });
+          const body = { pap_token: TOKEN, bot_token: token };
+          if (webhook) body.webhook_url = webhook;
+          const out = await api('PUT', '/telepath/api/pap/bot', body);
           toast('linked: @'+out.bot.bot_username);
           setTimeout(load, 600);
         } catch (e) { toast('failed: '+e.message); }
@@ -1154,21 +1271,25 @@ input:focus, textarea:focus { outline:none; border-color:var(--tg-theme-button-c
     }
   }
 
-  function openBroadcastModal() {
+  function openBroadcastModal(mode) {
     const overlay = document.createElement('div');
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;display:flex;align-items:flex-end;justify-content:center;';
+    const isWebhook = mode === 'webhook';
     overlay.innerHTML = ''+
       '<div style="background:#181818;width:100%;max-width:600px;border-radius:16px 16px 0 0;padding:20px 18px 28px;">'+
-        '<div style="font-size:18px;font-weight:800;margin-bottom:6px">update bot</div>'+
-        '<div class="muted" style="margin-bottom:14px">syncs the bot\\'s name, description, and menu button to your project. optionally send a message to subscribers.</div>'+
-        '<textarea id="bcMsg" rows="3" placeholder="what\\'s new? 👀  (leave empty to skip broadcast)"></textarea>'+
-        '<button class="btn full" id="bcSend">↻ update bot</button>'+
+        '<div style="font-size:18px;font-weight:800;margin-bottom:6px">'+(isWebhook?'resync profile':'update bot')+'</div>'+
+        '<div class="muted" style="margin-bottom:14px">'+(isWebhook
+          ? 'pushes the latest project name, description, and menu button to telegram. broadcast disabled in webhook mode (your handler manages users).'
+          : 'syncs the bot\\'s name, description, and menu button to your project. optionally send a message to subscribers.')+
+        '</div>'+
+        (isWebhook ? '' : '<textarea id="bcMsg" rows="3" placeholder="what\\'s new? 👀  (leave empty to skip broadcast)"></textarea>')+
+        '<button class="btn full" id="bcSend">↻ '+(isWebhook?'resync':'update bot')+'</button>'+
         '<button class="btn ghost full" id="bcCancel" style="margin-top:8px">cancel</button>'+
       '</div>';
     document.body.appendChild(overlay);
     document.getElementById('bcCancel').onclick = () => overlay.remove();
     document.getElementById('bcSend').onclick = async () => {
-      const message = document.getElementById('bcMsg').value.trim();
+      const message = isWebhook ? '' : (document.getElementById('bcMsg').value || '').trim();
       try {
         const out = await api('POST', '/telepath/api/pap/bot/sync', { pap_token: TOKEN, message });
         if (out.broadcast && !out.broadcast.skipped) {
