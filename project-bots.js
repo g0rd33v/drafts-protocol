@@ -3,7 +3,7 @@
 // Each Drafts project (PAP) can have an attached Telegram bot. The bot acts
 // as a public mini-app shell + a webhook forwarder + auto analytics recorder.
 //
-// Two modes per project bot:
+// Three modes per project bot:
 //
 //   1) Webhook mode — project.bot.webhook_url is set:
 //      Drafts long-polls Telegram for updates and POSTs each update to
@@ -11,13 +11,34 @@
 //      Cloudflare Workers, Render, their VPS) and replies to Telegram
 //      directly using their own bot token. Drafts is a pure pipe.
 //
-//   2) Default mode — webhook_url is NOT set:
-//      Drafts handles a minimal built-in flow: /start subscribes the user,
-//      /stop unsubscribes, anything else gets a polite nudge. The owner
-//      can broadcast updates via the WebApp dashboard.
+//   2) Bot.json mode (v0.9.3) — webhook_url is NOT set, AND project's
+//      live folder contains a bot.json file. Drafts loads bot.json and
+//      drives the bot from it: command handlers, callback buttons, screens.
+//      See bot.json schema below. This is the agent-friendly mode: an agent
+//      uploads bot.json + commits + promotes, and the bot updates instantly.
 //
-// In BOTH modes, every update is recorded by analytics.js (privacy-respecting
+//   3) Default mode — webhook_url is NOT set AND no bot.json. Drafts handles
+//      a minimal built-in flow: /start subscribes the user, /stop unsubscribes,
+//      anything else gets a polite nudge.
+//
+// In ALL modes, every update is recorded by analytics.js (privacy-respecting
 // metadata only — never raw message text). Owner can view + export from WebApp.
+//
+// bot.json schema (v0.9.3):
+// {
+//   "version": "drafts.bot.v1",
+//   "commands": [
+//     { "command": "start", "description": "Begin", "reply": { "text": "...", "parse_mode": "HTML", "buttons": [...] } },
+//     ...
+//   ],
+//   "default_reply": { "text": "...", "parse_mode": "HTML", "buttons": [...] },
+//   "callbacks": {
+//     "<callback_data>": { "text": "...", "parse_mode": "HTML", "buttons": [...] },
+//     ...
+//   }
+// }
+// buttons format: [[ {text, url}, {text, callback_data} ], ...] — array of rows of inline-keyboard buttons.
+// Setting commands list also pushes them to Telegram via setMyCommands on every load.
 
 import fs from 'fs';
 import path from 'path';
@@ -41,6 +62,8 @@ const WEBHOOK_RETRY_DELAY_MS = 2000;
 const WEBHOOK_LOG_MAX = 20;
 
 const pollers = new Map();
+// Cache: projectName -> { mtime, parsed }
+const botJsonCache = new Map();
 
 // ─────────────────────────────────────────────────────────────
 // Telegram HTTP client (per-bot — token passed in)
@@ -162,6 +185,69 @@ function appendWebhookLog(project, entry) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// bot.json loader (v0.9.3) — reads from <live>/bot.json with mtime-based cache
+// ─────────────────────────────────────────────────────────────
+function loadBotJson(projectName) {
+  try {
+    const livePath = path.join(process.env.DRAFTS_DIR || '/var/lib/drafts', projectName, 'live', 'bot.json');
+    if (!fs.existsSync(livePath)) return null;
+    const stat = fs.statSync(livePath);
+    const mtime = stat.mtimeMs;
+    const cached = botJsonCache.get(projectName);
+    if (cached && cached.mtime === mtime) return cached.parsed;
+    const raw = fs.readFileSync(livePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    botJsonCache.set(projectName, { mtime, parsed });
+    return parsed;
+  } catch (e) {
+    console.warn('[project-bot:' + projectName + '] bot.json load failed:', e.message);
+    return null;
+  }
+}
+
+function buildKeyboardFromButtons(buttons) {
+  if (!Array.isArray(buttons) || !buttons.length) return null;
+  // Accept either flat array (auto-wrap to single column) or array-of-rows.
+  const rows = Array.isArray(buttons[0]) ? buttons : buttons.map(b => [b]);
+  const inline_keyboard = rows.map(row =>
+    row.map(b => {
+      const btn = { text: String(b.text || '?').slice(0, 64) };
+      if (b.url) btn.url = String(b.url);
+      else if (b.callback_data) btn.callback_data = String(b.callback_data).slice(0, 64);
+      else if (b.web_app_url) btn.web_app = { url: String(b.web_app_url) };
+      else btn.callback_data = 'noop';
+      return btn;
+    })
+  );
+  return { inline_keyboard };
+}
+
+async function sendReply(token, chatId, reply) {
+  if (!reply) return;
+  const text = String(reply.text || '').slice(0, 4000);
+  if (!text) return;
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: reply.parse_mode || 'HTML',
+    disable_web_page_preview: reply.disable_web_page_preview !== false,
+  };
+  const kb = buildKeyboardFromButtons(reply.buttons);
+  if (kb) payload.reply_markup = kb;
+  await tgApi(token, 'sendMessage', payload).catch(e => {
+    console.warn('sendMessage failed:', e.message);
+  });
+}
+
+async function answerCallback(token, callbackId, opts = {}) {
+  return tgApi(token, 'answerCallbackQuery', {
+    callback_query_id: callbackId,
+    text: opts.text || '',
+    show_alert: !!opts.show_alert,
+  }).catch(() => {});
+}
+
+// ─────────────────────────────────────────────────────────────
 // Profile content extraction from project's live/index.html
 // ─────────────────────────────────────────────────────────────
 function readMeta(projectName) {
@@ -208,7 +294,51 @@ function removeSubscriber(project, tgUserId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Default mode handler — minimal /start, /stop
+// bot.json-driven handler (v0.9.3)
+// ─────────────────────────────────────────────────────────────
+async function handleBotJsonUpdate(project, upd, botJson) {
+  const token = project.bot?.token;
+  if (!token) return;
+
+  // Callback query
+  if (upd.callback_query) {
+    const cq = upd.callback_query;
+    await answerCallback(token, cq.id);
+    const data = String(cq.data || '');
+    const cbReply = botJson.callbacks && botJson.callbacks[data];
+    if (cbReply && cq.message) {
+      await sendReply(token, cq.message.chat.id, cbReply);
+    }
+    return;
+  }
+
+  // Message with command
+  if (upd.message && upd.message.text) {
+    const chatId = upd.message.chat.id;
+    const text = String(upd.message.text).trim();
+    let cmd = null;
+    if (text.startsWith('/')) {
+      cmd = text.slice(1).split(/[\s@]/)[0].toLowerCase();
+    }
+    if (cmd) {
+      const cmds = Array.isArray(botJson.commands) ? botJson.commands : [];
+      const match = cmds.find(c => String(c.command || '').toLowerCase() === cmd);
+      if (match && match.reply) {
+        // Track /start subscriber for analytics-friendly broadcasts
+        if (cmd === 'start' && upd.message.from) addSubscriber(project, upd.message.from.id);
+        await sendReply(token, chatId, match.reply);
+        return;
+      }
+    }
+    // Default reply
+    if (botJson.default_reply) {
+      await sendReply(token, chatId, botJson.default_reply);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Default mode handler — minimal /start, /stop (only when no bot.json)
 // ─────────────────────────────────────────────────────────────
 async function handleDefaultModeUpdate(project, upd) {
   try {
@@ -291,7 +421,13 @@ async function dispatchUpdate(project, upd) {
   if (project.bot?.webhook_url) {
     await handleWebhookModeUpdate(project, upd);
   } else {
-    await handleDefaultModeUpdate(project, upd);
+    // v0.9.3: try bot.json first, fall back to default mode
+    const botJson = loadBotJson(project.name);
+    if (botJson && (Array.isArray(botJson.commands) || botJson.default_reply || botJson.callbacks)) {
+      await handleBotJsonUpdate(project, upd, botJson);
+    } else {
+      await handleDefaultModeUpdate(project, upd);
+    }
   }
 }
 
@@ -386,13 +522,22 @@ async function applyBotProfile(project) {
   }
 
   if (!project.bot.webhook_url) {
+    // v0.9.3: prefer commands from bot.json if present
+    const botJson = loadBotJson(project.name);
+    let commands;
+    if (botJson && Array.isArray(botJson.commands) && botJson.commands.length) {
+      commands = botJson.commands.slice(0, 100).map(c => ({
+        command: String(c.command || '').slice(0, 32).toLowerCase(),
+        description: String(c.description || '').slice(0, 256),
+      })).filter(c => c.command && c.description);
+    } else {
+      commands = [
+        { command: 'start', description: 'Subscribe to updates' },
+        { command: 'stop',  description: 'Unsubscribe from updates' },
+      ];
+    }
     try {
-      await tgApi(token, 'setMyCommands', {
-        commands: [
-          { command: 'start', description: 'Subscribe to updates' },
-          { command: 'stop',  description: 'Unsubscribe from updates' },
-        ],
-      });
+      await tgApi(token, 'setMyCommands', { commands });
     } catch (e) {
       console.warn('[project-bot:' + project.name + '] setMyCommands failed:', e.message);
     }
@@ -497,12 +642,15 @@ async function unlinkBot(project, opts = {}) {
   }
   stopPolling(project.name);
   delete project.bot;
+  botJsonCache.delete(project.name);
   saveDraftsState();
   return { removed: wasInstalled };
 }
 
 async function syncBot(project, broadcastMessageHtml) {
   if (!project.bot || !project.bot.token) throw new Error('no_bot');
+  // Bust bot.json cache so newly-uploaded bot.json takes effect immediately
+  botJsonCache.delete(project.name);
   const result = await applyBotProfile(project);
   let broadcastResult = { sent: 0, failed: 0, skipped: true };
   if (broadcastMessageHtml && broadcastMessageHtml.trim() && !project.bot.webhook_url) {
@@ -542,6 +690,11 @@ function setAnalyticsEnabled(project, enabled) {
 function getBotStatus(project) {
   if (!project.bot || !project.bot.token) return { installed: false };
   const ctx = pollers.get(project.name);
+  const botJson = project.bot.webhook_url ? null : loadBotJson(project.name);
+  let mode;
+  if (project.bot.webhook_url) mode = 'webhook';
+  else if (botJson) mode = 'bot.json';
+  else mode = 'default';
   return {
     installed: true,
     bot_id: project.bot.bot_id,
@@ -553,7 +706,9 @@ function getBotStatus(project) {
     polling: !!(ctx && ctx.polling && !ctx.abort),
     webhook_url: project.bot.webhook_url || null,
     webhook_log: (project.bot.webhook_log || []).slice(0, WEBHOOK_LOG_MAX),
-    mode: project.bot.webhook_url ? 'webhook' : 'default',
+    mode,
+    bot_json_active: !!botJson,
+    bot_json_commands: botJson && Array.isArray(botJson.commands) ? botJson.commands.length : 0,
     analytics_enabled: project.bot.analytics_enabled !== false,
   };
 }
@@ -597,4 +752,5 @@ export const projectBotsApi = {
   addSubscriber,
   removeSubscriber,
   validateWebhookUrl,
+  loadBotJson,
 };
