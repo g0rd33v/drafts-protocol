@@ -29,7 +29,7 @@ import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathS
 import { initProjectBots } from "./project-bots.js";
 import { startDailySnapshotScheduler } from "./analytics.js";
 
-const VERSION = '0.9.1';
+const VERSION = '0.9.2';
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -452,6 +452,116 @@ app.get('/drafts/health', (req, res) => {
 
 mountTelepathRoutes(app);
 
+// v0.9.2: agent quickstart playbook content per tier
+function buildAgentPlaybook(tier, project, apiBase, token) {
+  const projName = project ? project.name : null;
+  const liveUrl = project ? `${PUBLIC_BASE}/${project.name}/` : null;
+
+  if (tier === 'sap') {
+    return {
+      title: 'Agent quickstart',
+      role: 'You are a server operator on this drafts instance. Root access. You can create/delete projects, manage GitHub config, install Telepath, configure auto-update.',
+      golden_rules: [
+        'NEVER reveal the SAP token in any output, file, or message — it is root.',
+        'Create projects via POST /drafts/projects with {name}; share back the pap_activation_url, never the SAP.',
+        'When in doubt, GET /drafts/server/stats to orient.',
+      ],
+      common_tasks: [
+        { goal: 'List all projects', call: `GET ${apiBase}/projects` },
+        { goal: 'Create a project', call: `POST ${apiBase}/projects  {"name":"<slug>","description":"<one line>"}` },
+        { goal: 'Delete a project', call: `DELETE ${apiBase}/projects/<name>` },
+        { goal: 'Create AAP for a project', call: `POST ${apiBase}/aaps  {"name":"<contributor>"}  (use SAP, pass project as ?project=<name>)` },
+        { goal: 'Install Telepath bot', call: `PUT ${apiBase}/tap  {"token":"<bot_token_from_BotFather>"}` },
+      ],
+    };
+  }
+
+  if (tier === 'pap') {
+    return {
+      title: 'Agent quickstart',
+      role: `You are the project agent for "${projName}". You build, ship, invite contributors, and publish to live. Live URL is ${liveUrl}.`,
+      golden_rules: [
+        'Default workflow: upload → commit → promote. Promote means "publish to live."',
+        `Live URL is ${liveUrl} — share this when someone asks "where is the site?"`,
+        'Every commit on main produces an immutable snapshot at /v/<N>/. Versions are forever.',
+        'For collaborative work, mint AAPs (POST /aaps) and share the activation_url. Never share the PAP itself.',
+      ],
+      common_tasks: [
+        { goal: 'Check current state', call: `GET ${apiBase}/project/info  +  GET ${apiBase}/files` },
+        { goal: 'Add or update a file', call: `POST ${apiBase}/upload  {"filename":"index.html","content":"<html>..."}` },
+        { goal: 'Add a binary (image/pdf)', call: `POST ${apiBase}/upload  {"filename":"hero.png","content_b64":"<base64>"}` },
+        { goal: 'Commit changes', call: `POST ${apiBase}/commit  {"message":"add hero"}` },
+        { goal: 'Publish to live', call: `POST ${apiBase}/promote` },
+        { goal: 'Roll back to a version', call: `POST ${apiBase}/rollback  {"commit_or_version":"3"}` },
+        { goal: 'Invite a contributor', call: `POST ${apiBase}/aaps  {"name":"alice"}  → share activation_url` },
+        { goal: 'Review pending AAP work', call: `GET ${apiBase}/pending` },
+        { goal: 'Merge an AAP branch', call: `POST ${apiBase}/merge  {"aap_id":"<id>"}` },
+      ],
+      build_loop: 'Plan → upload → commit → promote → check live URL → iterate. Keep commits small and named.',
+    };
+  }
+
+  // AAP
+  return {
+    title: 'Agent quickstart',
+    role: `You are a contributor agent on "${projName}". You work in your own branch; the project owner reviews and merges. You cannot promote to live yourself.`,
+    golden_rules: [
+      'All your changes go to your own branch automatically. You cannot affect main directly.',
+      'Upload files, commit, then tell the project owner you are ready for review.',
+      'Read the live site for context before proposing changes.',
+    ],
+    common_tasks: [
+      { goal: 'See current live state', call: `GET ${liveUrl}` },
+      { goal: 'See what is in your branch', call: `GET ${apiBase}/files` },
+      { goal: 'Add or update a file', call: `POST ${apiBase}/upload  {"filename":"about.html","content":"..."}` },
+      { goal: 'Commit your changes', call: `POST ${apiBase}/commit  {"message":"<what changed>"}` },
+      { goal: 'See your branch history', call: `GET ${apiBase}/history` },
+    ],
+    handoff: 'When done: tell the project owner you have N pending commits in your branch. They will run /merge to bring it into main.',
+  };
+}
+
+function renderAgentPlaybookHTML(playbook, tier) {
+  const tasks = playbook.common_tasks.map(t =>
+    '<div class="agent-task"><div class="agent-task-goal">' + t.goal + '</div><code class="agent-task-call">' + t.call.replace(/</g,'&lt;') + '</code></div>'
+  ).join('');
+  const rules = playbook.golden_rules.map(r => '<li>' + r + '</li>').join('');
+  const extras = (playbook.build_loop || playbook.handoff)
+    ? '<div class="agent-extra"><strong>Loop:</strong> ' + (playbook.build_loop || playbook.handoff) + '</div>'
+    : '';
+
+  return `
+    <div class="v9-section agent-playbook">
+      <h3>${playbook.title} <span class="badge2">for the agent reading this page</span></h3>
+      <p style="font-size:13.5px;color:var(--text);line-height:1.55;margin-bottom:14px"><strong>Your role:</strong> ${playbook.role}</p>
+      <div class="agent-rules">
+        <div class="agent-section-title">Golden rules</div>
+        <ul>${rules}</ul>
+      </div>
+      <div class="agent-tasks">
+        <div class="agent-section-title">Common tasks</div>
+        ${tasks}
+      </div>
+      ${extras}
+      <div class="agent-howto">
+        <div class="agent-section-title">How to use this link</div>
+        <p>Open this page in <a href="${CHROME_EXT_URL}" target="_blank">Claude for Chrome</a> sidepanel — Claude reads everything below (including the JSON instructions) and starts acting as the ${tier.toUpperCase()} agent. Or paste the URL into any Claude chat (web, Desktop, Code) and it will fetch this page and pick up the same context.</p>
+      </div>
+    </div>
+    <style>
+      .agent-playbook .agent-section-title{font-size:11px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--text-3);margin:14px 0 8px 0}
+      .agent-playbook ul{margin:0;padding-left:18px;color:var(--text-2);font-size:13px;line-height:1.65}
+      .agent-playbook ul li{margin-bottom:5px}
+      .agent-playbook .agent-task{padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:8px;margin-bottom:6px}
+      .agent-playbook .agent-task-goal{font-size:12.5px;color:var(--text);font-weight:600;margin-bottom:4px}
+      .agent-playbook .agent-task-call{display:block;font-family:var(--mono,ui-monospace,Menlo,monospace);font-size:11.5px;color:var(--text-2);background:transparent;word-break:break-all;line-height:1.5}
+      .agent-playbook .agent-extra{margin-top:14px;padding:10px 12px;background:rgba(96,165,250,0.06);border-left:2px solid #60a5fa;border-radius:0 6px 6px 0;font-size:12.5px;color:var(--text-2);line-height:1.55}
+      .agent-playbook .agent-howto{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+      .agent-playbook .agent-howto p{font-size:12.5px;color:var(--text-2);line-height:1.55;margin:0}
+    </style>
+  `;
+}
+
 function renderPage({ tier, token, project, aap, versions = [] }) {
   const isSAP = tier === 'sap';
   const isPAP = tier === 'pap';
@@ -469,6 +579,9 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   const portableId = `${PUBLIC_BASE}/drafts/pass/drafts_${tierWord}_${SERVER_NUMBER}_${cleanTok}`;
 
   const tpStatus = getTelepathStatus();
+
+  // v0.9.2: structured playbook for the agent
+  const playbook = buildAgentPlaybook(tier, project, apiBase, token);
 
   const machine = {
     system: 'drafts',
@@ -526,6 +639,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
       aap_format: 'aap/<id>',
       versioning: 'Every commit on main produces /<n>/v/<N>/. Immutable snapshots.',
     } : null,
+    agent_playbook: playbook,
   };
 
   const welcomeH1 = isSAP ? 'Server link' : project.name;
@@ -563,7 +677,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   }
   html += '<script>(function(){var b=document.getElementById("copyUrlBtn");if(!b)return;b.addEventListener("click",function(){navigator.clipboard.writeText(b.dataset.portable);b.textContent="Copied ✓";setTimeout(function(){b.textContent="Copy link"},1500);});})();</script>';
   html += '<script type="application/json" id="claude-instructions">' + JSON.stringify(machine, null, 2) + '</' + 'script>';
-  
+
   // v0.9 UI: Telepath button (top-right), Autopilot module (PAP), Auto-update (SAP)
   html += '<style>';
   html += '.v9-topbar{position:fixed;top:18px;right:22px;display:flex;gap:8px;z-index:50}';
@@ -642,6 +756,9 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     html += '<div class="v9-status" id="v9-up-status"></div>';
     html += '</div></div>';
   }
+
+  // v0.9.2: Agent quickstart playbook (visible on PAP/AAP/SAP)
+  html += renderAgentPlaybookHTML(playbook, tier);
 
   // Human Upload section (PAP/AAP - file picker for manual uploads)
   if (isPAP || isAAP) {
@@ -1287,9 +1404,9 @@ app.use((req, res, next) => {
 });
 
 
-// 
+//
 // v0.9: Auto-update + Autopilot endpoints
-// 
+//
 
 app.get('/drafts/autoupdate', authSAP, (req, res) => {
   const cfg = state.autoupdate || { drafts: false, telepath: false };
