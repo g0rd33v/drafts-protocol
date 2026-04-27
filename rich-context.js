@@ -44,7 +44,7 @@ function buildCapabilities() {
     { icon: 'landing', t: 'Static HTML/CSS/JS', d: 'Single-file pages, fast, adaptive, mobile-ready' },
     { icon: 'media',   t: 'Media assets',       d: 'Upload images, audio — rendered inline' },
     { icon: 'git',     t: 'Git versioning',     d: 'Every commit tracked. Rollback with one sentence' },
-    { icon: 'cdn',     t: 'Public URLs + SSL',  d: 'beta.labs.vc/live/&lt;project&gt; — HTTPS, auto-issued' },
+    { icon: 'cdn',     t: 'Public URLs + SSL',  d: 'beta.labs.vc/&lt;project&gt; — HTTPS, auto-issued' },
     { icon: 'llm',     t: 'Client-side LLM',    d: 'You bring Claude. Any plan. Free works' },
     { icon: 'runtime', t: 'Node 18 build zone', d: 'Modern JS libs from CDN: React, D3, Tailwind' },
   ];
@@ -141,7 +141,7 @@ export function buildRichContext({ tier, token, project, projectsDir, publicBase
   // Project header (only for PAP/AAP)
   let projHeader = '';
   if (project) {
-    const liveUrl = publicBase + '/live/' + project.name + '/';
+    const liveUrl = publicBase + '/' + project.name + '/';
     const repoBtn = project.github_repo
       ? '<a class="btn-quick" href="https://github.com/' + esc(project.github_repo) + '" target="_blank" rel="noopener">Repository ↗</a>'
       : '<span class="btn-quick ghost" title="Not linked yet. Ask Claude to link a GitHub repo">Repository (unlinked)</span>';
