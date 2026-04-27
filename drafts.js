@@ -1,12 +1,18 @@
-// drafts v0.2 — Three-tier access model. Reference implementation of the drafts protocol.
+// drafts v0.8 — Three-tier access model + Telepath + Project Bots + Per-project analytics + SAP drafts-event notifications.
 //
-// Tiers:
-//   SAP (Server API Pass)  — server root
-//   PAP (Project API Pass) — project owner
-//   AAP (Agent API Pass)   — contributor / AI agent
+// v0.8 adds:
+//   - SAP-event notifications (boot, version bump, schema migration, errors) via telepathHooks
+//   - Persisted last_known_version in state for version-bump detection
+//   - GitHub auto-sync setting per project (auto-pushes to GitHub on every commit)
 //
-// All control plane happens through chat-driven HTTP calls. Pages are welcome
-// screens + a machine-readable JSON block for any LLM reading them.
+// Public URL scheme:
+//   /<n>/                     -> live
+//   /<n>/<path>               -> file from live
+//   /<n>/v/<N>/               -> snapshot of commit #N
+//   /<n>/v/<N>/<path>         -> file from snapshot N
+//   /drafts/pass/<token>         -> welcome (SAP/PAP/AAP)
+//   /drafts/...                  -> API
+//   /telepath/app/{sap|pap|aap}  -> Telegram WebApp dashboards
 //
 // Spec & registry: https://github.com/g0rd33v/drafts-protocol
 
@@ -19,6 +25,11 @@ import crypto from 'crypto';
 import { execSync } from 'child_process';
 import dotenv from 'dotenv';
 import { buildRichContext } from "./rich-context.js";
+import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathStatus } from "./telepath.js";
+import { initProjectBots } from "./project-bots.js";
+import { startDailySnapshotScheduler } from "./analytics.js";
+
+const VERSION = '0.9';
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -28,6 +39,7 @@ const PORT            = Number(process.env.PORT || 3100);
 const SERVER_NUMBER   = Number(process.env.SERVER_NUMBER || 0);
 let   SAP_TOKEN       = process.env.BEARER_TOKEN || process.env.SAP_TOKEN;
 const DRAFTS_DIR      = process.env.DRAFTS_DIR || '/var/lib/drafts';
+process.env.DRAFTS_DIR = DRAFTS_DIR;
 const PUBLIC_BASE     = process.env.PUBLIC_BASE_URL || process.env.PUBLIC_BASE || (() => {
   console.error('FATAL: PUBLIC_BASE_URL must be set (e.g. https://drafts.example.com)');
   process.exit(1);
@@ -37,7 +49,14 @@ const GITHUB_TOKEN    = process.env.GITHUB_TOKEN || '';
 const STATE_PATH      = path.join(DRAFTS_DIR, '.state.json');
 const CHROME_EXT_URL  = 'https://chromewebstore.google.com/detail/claude-for-chrome/fmpnliohjhemenmnlpbfagaolkdacoja';
 
-// Auto-mint SAP on first run if not provided
+const RESERVED_NAMES = new Set([
+  'drafts', 'live', 'api', 'pass', 'v', 'version', 'versions',
+  'health', 'whoami', 'projects', 'aaps', 'aap', 'pap', 'sap', 'tap',
+  'static', 'assets', 'admin', 'www', '_', 'config', 'github',
+  'upload', 'commit', 'promote', 'rollback', 'pending', 'merge',
+  'files', 'file', 'history', 'about', 'gallery', 'docs', 'telepath',
+]);
+
 if (!SAP_TOKEN) {
   SAP_TOKEN = crypto.randomBytes(8).toString('hex');
   const sapFile = '/etc/labs/drafts.sap';
@@ -55,12 +74,7 @@ if (!SAP_TOKEN) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// State (persisted to .state.json)
-// ─────────────────────────────────────────────────────────────
-
 let state = { projects: [], github_default: null };
-
 function loadState() {
   try {
     if (fs.existsSync(STATE_PATH)) {
@@ -78,21 +92,52 @@ function saveState() {
 }
 loadState();
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
+// One-time migration: ensure every project.bot has webhook_url + webhook_log fields (v0.6 schema)
+function migrateProjectBotsToV06() {
+  let changed = 0;
+  for (const p of state.projects) {
+    if (p.bot && p.bot.token) {
+      if (!('webhook_url' in p.bot)) { p.bot.webhook_url = null; changed++; }
+      if (!Array.isArray(p.bot.webhook_log)) { p.bot.webhook_log = []; changed++; }
+    }
+  }
+  if (changed > 0) {
+    saveState();
+    console.log(`[drafts] migrated ${changed} bot field(s) to v0.6 schema`);
+    setTimeout(() => { try { telepathHooks.onSchemaMigration(`v0.6 bot schema: ${changed} field(s) added`); } catch (e) {} }, 5000);
+  }
+}
+migrateProjectBotsToV06();
+
+// v0.8 migration: ensure github_autosync field on each project (default false)
+function migrateProjectsToV08() {
+  let changed = 0;
+  for (const p of state.projects) {
+    if (!('github_autosync' in p)) { p.github_autosync = false; changed++; }
+  }
+  if (changed > 0) {
+    saveState();
+    console.log(`[drafts] migrated ${changed} project(s) to v0.8 schema (github_autosync default false)`);
+    setTimeout(() => { try { telepathHooks.onSchemaMigration(`v0.8 schema: ${changed} project(s) got github_autosync field`); } catch (e) {} }, 5000);
+  }
+}
+migrateProjectsToV08();
+
+// v0.8: detect version change vs persisted last_known_version (drafts schedules notify after Telepath ready)
+const previousVersion = state.last_known_version || null;
+const isVersionBump = previousVersion && previousVersion !== VERSION;
+const isFirstBoot = !previousVersion;
+state.last_known_version = VERSION;
+state.last_boot_at = new Date().toISOString();
+saveState();
 
 const TIER_BYTES = { sap: 8, pap: 6, aap: 5 };
 const newToken   = (prefix) => prefix + '_' + crypto.randomBytes(TIER_BYTES[prefix] || 6).toString('hex');
 const newId      = () => crypto.randomBytes(4).toString('hex');
 const now        = () => new Date().toISOString();
 
-function findProjectByName(name) {
-  return state.projects.find(p => p.name === name) || null;
-}
-function findProjectByPAP(token) {
-  return state.projects.find(p => p.pap && p.pap.token === token && !p.pap.revoked) || null;
-}
+function findProjectByName(name) { return state.projects.find(p => p.name === name) || null; }
+function findProjectByPAP(token) { return state.projects.find(p => p.pap && p.pap.token === token && !p.pap.revoked) || null; }
 function findProjectAndAAPByAAPToken(token) {
   for (const p of state.projects) {
     const a = (p.aaps || []).find(x => x.token === token && !x.revoked);
@@ -103,8 +148,8 @@ function findProjectAndAAPByAAPToken(token) {
 function sanitizeName(s) {
   return String(s || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
 }
+function isReservedName(name) { return RESERVED_NAMES.has(name); }
 
-// GitHub config resolution: per-project overrides server default overrides env
 function resolveGithubConfig(project) {
   if (project && project.github_config && project.github_config.token && project.github_config.user) {
     return { user: project.github_config.user, token: project.github_config.token, source: 'project' };
@@ -118,18 +163,64 @@ function resolveGithubConfig(project) {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Rate limits (in-memory sliding window)
-// ─────────────────────────────────────────────────────────────
+// Internal: push a project's main branch to GitHub (used by /github/sync and autosync)
+async function _githubSyncProject(project) {
+  if (!project.github_repo) throw new Error('project_not_linked_to_github');
+  const gh = resolveGithubConfig(project);
+  if (!gh) throw new Error('github_not_configured');
+  const pp = await ensureProjectDirs(project.name);
+  const git = simpleGit(pp.drafts);
+  await switchToBranch(git, 'main');
+  const remoteUrl = `https://${gh.user}:${gh.token}@github.com/${project.github_repo}.git`;
+  const remotes = await git.getRemotes();
+  if (!remotes.find(r => r.name === 'origin')) await git.addRemote('origin', remoteUrl);
+  else await git.remote(['set-url', 'origin', remoteUrl]);
+  await git.push(['-u', 'origin', 'main', '--force']);
+  await git.remote(['set-url', 'origin', `https://github.com/${project.github_repo}.git`]);
+  return { pushed_to: project.github_repo, config_source: gh.source };
+}
+
+async function _createProjectInternal({ name, description = '', github_repo = null, pap_name = null }) {
+  name = sanitizeName(name);
+  if (!name) throw new Error('invalid_name');
+  if (isReservedName(name)) throw new Error('reserved_name');
+  if (findProjectByName(name)) throw new Error('exists');
+  const pap = { id: newId(), token: newToken('pap'), name: pap_name, created_at: now(), revoked: false };
+  const proj = { name, description, github_repo, github_autosync: false, created_at: now(), pap, aaps: [] };
+  state.projects.push(proj);
+  saveState();
+  await ensureProjectDirs(name);
+  const papSecret = pap.token.replace(/^pap_/, '');
+  const out = {
+    project: name,
+    pap_token: pap.token,
+    pap_activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${papSecret}`,
+    live_url: `${PUBLIC_BASE}/${name}/`,
+    raw: proj,
+  };
+  try { telepathHooks.onNewProject(proj); } catch (e) {}
+  return out;
+}
+
+async function _createAAPInternal(project, { name = null }) {
+  const aap = { id: newId(), token: newToken('aap'), name: (name || '').toString().slice(0, 60) || null, created_at: now(), revoked: false, branch: '' };
+  aap.branch = `aap/${aap.id}`;
+  project.aaps = project.aaps || [];
+  project.aaps.push(aap);
+  saveState();
+  const aapSecret = aap.token.replace(/^aap_/, '');
+  return {
+    aap: { id: aap.id, name: aap.name, branch: aap.branch, created_at: aap.created_at, token: aap.token },
+    activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`,
+  };
+}
 
 const RATE = {
   sap:  { perMinute: 120, perHour: 2000, perDay: 20000 },
   pap:  { perMinute: 60,  perHour: 600,  perDay: 5000 },
   aap:  { perMinute: 10,  perHour: 60,   perDay: 300 },
 };
-
 const hits = new Map();
-
 function checkRate(tier, tokenId) {
   const limits = RATE[tier];
   if (!limits) return { ok: true };
@@ -154,37 +245,18 @@ function checkRate(tier, tokenId) {
   return { ok: true };
 }
 
-// ─────────────────────────────────────────────────────────────
-// Auth middleware
-// ─────────────────────────────────────────────────────────────
-
 function parseBearer(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
   return m ? m[1].trim() : null;
 }
-
 function authSAP(req, res, next) {
   const tok = parseBearer(req);
   if (!tok || tok !== SAP_TOKEN) return res.status(401).json({ ok: false, error: 'unauthorized' });
   const rl = checkRate('sap', 'root');
   if (!rl.ok) { res.set('Retry-After', rl.retryAfter); return res.status(429).json({ ok: false, error: 'rate_limited', window: rl.window, retry_after: rl.retryAfter }); }
-  req.tier = 'sap';
-  next();
+  req.tier = 'sap'; next();
 }
-
-function authPAP(req, res, next) {
-  const tok = parseBearer(req);
-  if (!tok) return res.status(401).json({ ok: false, error: 'unauthorized' });
-  const p = findProjectByPAP(tok);
-  if (!p) return res.status(401).json({ ok: false, error: 'unauthorized' });
-  const rl = checkRate('pap', p.pap.id);
-  if (!rl.ok) { res.set('Retry-After', rl.retryAfter); return res.status(429).json({ ok: false, error: 'rate_limited', window: rl.window, retry_after: rl.retryAfter }); }
-  req.tier = 'pap';
-  req.project = p;
-  next();
-}
-
 function authPAPorSAP(req, res, next) {
   const tok = parseBearer(req);
   if (!tok) return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -193,13 +265,10 @@ function authPAPorSAP(req, res, next) {
   if (p) {
     const rl = checkRate('pap', p.pap.id);
     if (!rl.ok) { res.set('Retry-After', rl.retryAfter); return res.status(429).json({ ok: false, error: 'rate_limited', window: rl.window, retry_after: rl.retryAfter }); }
-    req.tier = 'pap';
-    req.project = p;
-    return next();
+    req.tier = 'pap'; req.project = p; return next();
   }
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
-
 function authAny(req, res, next) {
   const tok = parseBearer(req);
   if (!tok) return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -219,16 +288,13 @@ function authAny(req, res, next) {
   return res.status(401).json({ ok: false, error: 'unauthorized' });
 }
 
-// ─────────────────────────────────────────────────────────────
-// Project filesystem + git
-// ─────────────────────────────────────────────────────────────
-
 function projectPaths(name) {
   const root = path.join(DRAFTS_DIR, name);
   return {
     root,
     drafts: path.join(root, 'drafts'),
     live:   path.join(root, 'live'),
+    versions: path.join(root, 'v'),
   };
 }
 
@@ -236,6 +302,7 @@ async function ensureProjectDirs(name) {
   const pp = projectPaths(name);
   await fsp.mkdir(pp.drafts, { recursive: true });
   await fsp.mkdir(pp.live,   { recursive: true });
+  await fsp.mkdir(pp.versions, { recursive: true });
   const git = simpleGit(pp.drafts);
   if (!fs.existsSync(path.join(pp.drafts, '.git'))) {
     await git.init();
@@ -251,23 +318,6 @@ async function ensureProjectDirs(name) {
   return pp;
 }
 
-async function createPublicSymlinks(name) {
-  const liveHtmlDir = `/var/www/html/live/${name}`;
-  const viewHtmlDir = `/var/www/html/drafts-view/${name}`;
-  try { execSync(`ln -sfn "${projectPaths(name).live}" "${liveHtmlDir}"`); } catch (e) {}
-  try { execSync(`ln -sfn "${projectPaths(name).drafts}" "${viewHtmlDir}"`); } catch (e) {}
-}
-function removePublicSymlinks(name) {
-  try { execSync(`rm -f "/var/www/html/live/${name}" "/var/www/html/drafts-view/${name}"`); } catch (e) {}
-}
-
-async function currentBranch(git) {
-  try {
-    const s = await git.status();
-    return s.current || 'main';
-  } catch (e) { return 'main'; }
-}
-
 async function switchToBranch(git, branch) {
   const branches = await git.branch();
   if (branches.all.includes(branch)) {
@@ -278,21 +328,131 @@ async function switchToBranch(git, branch) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// App
-// ─────────────────────────────────────────────────────────────
+async function materializeVersion(name) {
+  const pp = projectPaths(name);
+  let total;
+  try {
+    total = Number(execSync(`git -C "${pp.drafts}" rev-list --count main`).toString().trim());
+  } catch (e) {
+    return null;
+  }
+  const N = Math.max(1, total - 1);
+  const dest = path.join(pp.versions, String(N));
+  if (fs.existsSync(dest)) return N;
+  const tmp = dest + '.tmp';
+  try { execSync(`rm -rf "${tmp}"`); } catch (e) {}
+  await fsp.mkdir(pp.versions, { recursive: true });
+  execSync(`cp -a "${pp.drafts}/." "${tmp}"`);
+  try { execSync(`rm -rf "${tmp}/.git" "${tmp}/.drafts-init"`); } catch (e) {}
+  execSync(`mv "${tmp}" "${dest}"`);
+  return N;
+}
+
+async function promoteToLive(name) {
+  const pp = projectPaths(name);
+  const tmp = pp.live + '.tmp';
+  const old = pp.live + '.old';
+  try { execSync(`rm -rf "${tmp}" "${old}"`); } catch (e) {}
+  execSync(`cp -a "${pp.drafts}/." "${tmp}"`);
+  try { execSync(`rm -rf "${tmp}/.git" "${tmp}/.drafts-init"`); } catch (e) {}
+  try { execSync(`mv "${pp.live}" "${old}"`); } catch (e) {}
+  execSync(`mv "${tmp}" "${pp.live}"`);
+  try { execSync(`rm -rf "${old}"`); } catch (e) {}
+}
+
+async function listVersions(name) {
+  const pp = projectPaths(name);
+  if (!fs.existsSync(pp.versions)) return [];
+  const dirs = fs.readdirSync(pp.versions, { withFileTypes: true })
+    .filter(d => d.isDirectory() && /^\d+$/.test(d.name))
+    .map(d => Number(d.name))
+    .sort((a, b) => a - b);
+  return dirs;
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm':  'text/html; charset=utf-8',
+  '.css':  'text/css; charset=utf-8',
+  '.js':   'application/javascript; charset=utf-8',
+  '.mjs':  'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.txt':  'text/plain; charset=utf-8',
+  '.md':   'text/markdown; charset=utf-8',
+  '.svg':  'image/svg+xml',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.webp': 'image/webp',
+  '.ico':  'image/x-icon',
+  '.mp3':  'audio/mpeg',
+  '.mp4':  'video/mp4',
+  '.webm': 'video/webm',
+  '.pdf':  'application/pdf',
+  '.woff':  'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf':   'font/ttf',
+  '.otf':   'font/otf',
+};
+function mimeFor(filename) {
+  const ext = path.extname(filename).toLowerCase();
+  return MIME[ext] || 'application/octet-stream';
+}
+
+function resolveSafe(root, rel) {
+  const cleaned = rel.replace(/\.\.+/g, '').replace(/^\/+/, '');
+  const full = path.resolve(root, cleaned);
+  if (!full.startsWith(path.resolve(root))) return null;
+  return full;
+}
+
+function serveStatic(rootDir, relPath, res) {
+  const full = resolveSafe(rootDir, relPath);
+  if (!full) return res.status(400).type('text/plain').send('bad path');
+  if (!fs.existsSync(full)) return res.status(404).type('text/plain').send('not found');
+  let target = full;
+  let stat = fs.statSync(target);
+  if (stat.isDirectory()) {
+    const idx = path.join(target, 'index.html');
+    if (fs.existsSync(idx) && fs.statSync(idx).isFile()) {
+      target = idx;
+      stat = fs.statSync(target);
+    } else {
+      return res.status(404).type('text/plain').send('no index.html');
+    }
+  }
+  res.set('Content-Type', mimeFor(target));
+  res.set('Cache-Control', 'public, max-age=60');
+  res.set('Last-Modified', stat.mtime.toUTCString());
+  return fs.createReadStream(target).pipe(res);
+}
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
 // Health
-app.get('/drafts/health', (req, res) => res.json({ ok: true, version: '0.2', protocol: 'drafts', server_number: SERVER_NUMBER }));
+app.get('/drafts/health', (req, res) => {
+  const tp = getTelepathStatus();
+  const projectBotsCount = state.projects.filter(p => p.bot && p.bot.token).length;
+  const webhookBotsCount = state.projects.filter(p => p.bot && p.bot.token && p.bot.webhook_url).length;
+  const analyticsEnabledCount = state.projects.filter(p => p.bot && p.bot.token && p.bot.analytics_enabled !== false).length;
+  const githubAutosyncCount = state.projects.filter(p => p.github_autosync).length;
+  res.json({
+    ok: true,
+    version: VERSION,
+    protocol: 'drafts',
+    server_number: SERVER_NUMBER,
+    telepath: tp,
+    project_bots: { total: projectBotsCount, in_webhook_mode: webhookBotsCount, analytics_enabled: analyticsEnabledCount },
+    github_autosync_enabled: githubAutosyncCount,
+    uptime_sec: Math.floor(process.uptime()),
+  });
+});
 
-// ─────────────────────────────────────────────────────────────
-// Welcome page rendering
-// ─────────────────────────────────────────────────────────────
+mountTelepathRoutes(app);
 
-function renderPage({ tier, token, project, aap }) {
+function renderPage({ tier, token, project, aap, versions = [] }) {
   const isSAP = tier === 'sap';
   const isPAP = tier === 'pap';
   const isAAP = tier === 'aap';
@@ -300,283 +460,273 @@ function renderPage({ tier, token, project, aap }) {
   const roleBadge = isSAP ? 'SAP — server' : isPAP ? `PAP — ${project.name}` : `AAP — ${project.name}`;
   const title     = isSAP ? 'drafts · server link' : isPAP ? `drafts · ${project.name} (project link)` : `drafts · ${project.name} (agent link)`;
   const apiBase   = PUBLIC_BASE + '/drafts';
-
-  const liveUrl      = project ? `${PUBLIC_BASE}/live/${project.name}/` : null;
-  const draftsView   = project ? `${PUBLIC_BASE}/drafts-view/${project.name}/` : null;
+  const liveUrl   = project ? `${PUBLIC_BASE}/${project.name}/` : null;
+  const latestVersion = versions.length ? versions[versions.length - 1] : null;
+  const latestVersionUrl = (project && latestVersion) ? `${PUBLIC_BASE}/${project.name}/v/${latestVersion}/` : null;
 
   const tierWord = tier === "pap" ? "project" : tier === "aap" ? "agent" : tier === "sap" ? "server" : tier;
   const cleanTok = token.replace(/^(pap|aap)_/, "");
   const portableId = `${PUBLIC_BASE}/drafts/pass/drafts_${tierWord}_${SERVER_NUMBER}_${cleanTok}`;
 
-  // Machine-readable instruction block for any LLM reading the page
+  const tpStatus = getTelepathStatus();
+
   const machine = {
     system: 'drafts',
-    version: '0.2',
+    version: VERSION,
     tier,
     api_base: apiBase,
     auth: { header: 'Authorization', scheme: 'Bearer', token },
     portable_identifier: portableId,
     server_number: SERVER_NUMBER,
     registry_url: 'https://github.com/g0rd33v/drafts-protocol/blob/main/drafts-registry.json',
-    public_gallery: PUBLIC_BASE + '/drafts/',
-
-    what_this_link_is: isSAP
-      ? 'SERVER API PASS for drafts. Root access to this server. You can create new projects (each gets its own Project link for its owner), delete projects, and see all activity. Drafts is the platform where people build and publish websites, PWAs, and AI tools just by talking to Claude — no registration, no coding, just vibe. When the user drops this link into you, greet warmly and offer to show recent activity or spin up a new project. Treat this token as root; never share it in any output.'
-      : isPAP
-      ? `PROJECT API PASS for "${project.name}" on drafts. This is the owner\'s link. Drafts is the platform where people build and publish real websites, PWAs, and AI tools just by talking to Claude — no registration, no coding, just vibe. As the owner, the user can: build and edit files by just describing what they want; publish the live version to a public URL; invite teammates (say "invite Alice" and you mint an Agent link plus offer to draft an email); review contributor work and merge what is good; roll back to any previous version. You are the builder — make beautiful, fast, adaptive output with zero friction. On first load, briefly orient the user to current state (live files, recent activity), then ask what they want to ship next. Short, warm, builder-energy. Never share this Project link with contributors — always use Agent links.`
-      : `AGENT API PASS for "${project.name}" on drafts. This is a contributor link — the user was invited to help build on this project. Drafts is the platform where people build and publish real websites, PWAs, and AI tools just by talking to Claude — no registration, no coding, just vibe. Everything the user does lands in their own isolated branch; nothing they do breaks anything. The project owner reviews contributions and publishes what is good. On first load, greet warmly, offer to show what is currently live so they see the starting point, then ask what they would like to contribute. Short, builder-energy.`,
-
-    conversation_tone: {
-      mode: 'friendly, builder-energy, vibe-first. Drafts is about shipping beautiful things without friction — match that energy.',
-      yes: ['yo','bet','shipped','clean','cooking','sending it','lowkey','no cap'],
-      avoid: ['I would be happy to assist you','Certainly!','As an AI','corporate disclaimers','apologising for sandbox limits'],
-      emoji_policy: 'sparing — one or two per message max',
-      response_length: 'short, conversational',
-    },
-
-    on_first_load: {
-      summary: isSAP
-        ? 'Greet warmly and short. Offer a quick server overview (projects list, recent activity), then ask whether the user wants to spin up a new project or jump into an existing one. Builder-energy, not corporate.'
-        : `Check ${apiBase}/project/info + ${apiBase}/files?where=drafts + ${apiBase}/files?where=live + ${apiBase}/history?limit=5 and greet based on state.`,
-      if_content_exists: project ? `Navigate browser tab to ${liveUrl} BEFORE greeting so user sees current state. Then: "yo, picking up on ${project.name} — X files live, last commit was ...".` : null,
-      if_empty: project ? `"yo! ${project.name} is a clean slate ✨ what are we building?"` : null,
-    },
-
-    transport: 'Try built-in HTTP tools first (web_fetch / curl / code interpreter). On first failure, silently switch to Claude for Chrome extension and run same-origin fetch() there. Never apologize for sandbox limits; pivot quietly.',
-
-    verify_after_publish: project ? [
-      `GET ${apiBase}/files?where=live — confirm file appears`,
-      `GET ${liveUrl} — confirm HTTP 200 and content matches`,
-      'On mismatch: investigate via /history, fix, re-verify before reporting success',
-    ] : null,
-
-    capabilities: isSAP ? [
-      'list_all_projects', 'create_project_with_pap', 'delete_any_project', 'revoke_any_pap_or_aap', 'full_server_stats', 'configure_github_default',
-    ] : isPAP ? [
-      'project_info', 'list_aaps', 'mint_aap', 'revoke_aap',
-      'list_branches_and_pending_changes', 'merge_aap_branch',
-      'upload_to_main', 'commit', 'promote_to_live', 'rollback',
-      'github_sync (if configured)', 'configure_github_for_this_project', 'delete_own_project',
-    ] : [
-      'project_info (read-only parts)', 'list_own_files', 'upload_to_own_branch',
-      'commit_own_branch', 'read_file (own branch or live)', 'history (own branch)',
-    ],
-
-    endpoints: isSAP ? [
-      { method: 'GET',    path: '/whoami' },
-      { method: 'GET',    path: '/server/stats' },
-      { method: 'GET',    path: '/projects' },
-      { method: 'POST',   path: '/projects',                     body: '{name, description?, github_repo?}' },
-      { method: 'DELETE', path: '/projects/:name' },
-      { method: 'DELETE', path: '/projects/:name/pap' },
-      { method: 'GET',    path: '/config/github',                desc: 'view server-default GitHub config (token redacted)' },
-      { method: 'PUT',    path: '/config/github',                body: '{user, token}', desc: 'set server-default GitHub config' },
-      { method: 'DELETE', path: '/config/github',                desc: 'clear server-default GitHub config' },
-    ] : isPAP ? [
-      { method: 'GET',    path: '/whoami' },
-      { method: 'GET',    path: '/project/info' },
-      { method: 'GET',    path: '/project/stats' },
-      { method: 'POST',   path: '/aaps',                         body: '{name?}' },
-      { method: 'GET',    path: '/aaps' },
-      { method: 'DELETE', path: '/aaps/:id' },
-      { method: 'GET',    path: '/pending' },
-      { method: 'POST',   path: '/merge',                        body: '{aap_id}' },
-      { method: 'POST',   path: '/upload',                       body: '{filename, content, where?:"drafts"|"live"}' },
-      { method: 'POST',   path: '/commit',                       body: '{message?}' },
-      { method: 'POST',   path: '/promote',                      body: '{message?}' },
-      { method: 'POST',   path: '/rollback',                     body: '{commit}' },
-      { method: 'GET',    path: '/files?where=drafts|live' },
-      { method: 'GET',    path: '/file?path=...&where=...' },
-      { method: 'DELETE', path: '/file?path=...&where=...' },
-      { method: 'GET',    path: '/history?limit=50' },
-      { method: 'POST',   path: '/github/sync',                  body: '{branch?, message?}' },
-      { method: 'GET',    path: '/projects/:name/config/github' },
-      { method: 'PUT',    path: '/projects/:name/config/github', body: '{user, token}' },
-      { method: 'DELETE', path: '/projects/:name/config/github' },
-    ] : [
-      { method: 'GET',    path: '/whoami' },
-      { method: 'GET',    path: '/project/info' },
-      { method: 'POST',   path: '/upload',                       body: '{filename, content}' },
-      { method: 'POST',   path: '/commit',                       body: '{message?}' },
-      { method: 'GET',    path: '/files?where=drafts|live' },
-      { method: 'GET',    path: '/file?path=...&where=...' },
-      { method: 'GET',    path: '/history?limit=50' },
-    ],
-
-    examples: isSAP ? [
-      { user_says: 'create project foo, owner is Alice',
-        chat_does: `POST ${apiBase}/projects {"name":"foo","description":"Alice\'s project"} -> hand Alice the returned pap_activation_url` },
-      { user_says: 'show me all projects',
-        chat_does: `GET ${apiBase}/projects` },
-      { user_says: 'kill project bar',
-        chat_does: `DELETE ${apiBase}/projects/bar` },
-    ] : isPAP ? [
-      { user_says: 'invite Mike',
-        chat_does: `POST ${apiBase}/aaps {"name":"Mike"} -> returns activation_url, also offer to create Gmail draft addressed to Mike` },
-      { user_says: "what did my contributors push?",
-        chat_does: `GET ${apiBase}/pending` },
-      { user_says: 'merge Mike\'s changes',
-        chat_does: `GET ${apiBase}/aaps -> find id for Mike -> POST ${apiBase}/merge {"aap_id":"<id>"}` },
-      { user_says: 'publish',
-        chat_does: `POST ${apiBase}/promote -> GET ${liveUrl} to verify -> tell user "shipped, ${liveUrl}"` },
-      { user_says: 'revoke Mike',
-        chat_does: `GET ${apiBase}/aaps -> find Mike\'s id -> DELETE ${apiBase}/aaps/<id>` },
-    ] : [
-      { user_says: 'save this landing page',
-        chat_does: `POST ${apiBase}/upload {"filename":"index.html","content":"..."} -> automatically goes to your branch` },
-      { user_says: 'what\'s already in the project?',
-        chat_does: `GET ${apiBase}/files?where=live (shows main/live), ${apiBase}/files?where=drafts (shows your branch + main)` },
-    ],
-
-    email_draft_hint: isPAP ? {
-      subject: `You\'re invited to the "${project.name}" drafts project`,
-      body: `Hey,\n\nI\'ve set up a drafts workspace for "${project.name}" and added you as a contributor.\n\nYour link (it\'s your key — keep it to yourself):\n<AAP_ACTIVATION_URL>\n\nHow to use it:\n- Open Google Chrome, install Claude for Chrome if you don\'t have it: ${CHROME_EXT_URL}\n- Paste the link into the Claude side panel\n- Tell Claude what to build — it handles the code, versioning, everything.\n\nChanges you make land in your own branch. I review and publish. No dashboards, no terminals. Just chat.\n\nCheers,\n` ,
+    public_gallery: PUBLIC_BASE + '/',
+    telepath: tpStatus.installed ? { bot_username: tpStatus.bot?.username, polling: tpStatus.polling } : { installed: false },
+    url_scheme: project ? {
+      live: `${PUBLIC_BASE}/${project.name}/`,
+      live_file: `${PUBLIC_BASE}/${project.name}/<path>`,
+      version: `${PUBLIC_BASE}/${project.name}/v/<N>/`,
+      version_file: `${PUBLIC_BASE}/${project.name}/v/<N>/<path>`,
+      latest_version_number: latestVersion,
+      total_versions: versions.length,
     } : null,
-
+    what_this_link_is: isSAP
+      ? 'SERVER API PASS for drafts. Root access. Treat this token as root; never share it in any output.'
+      : isPAP
+      ? `PROJECT API PASS for "${project.name}" on drafts. Live at ${PUBLIC_BASE}/${project.name}/. Each commit produces an immutable snapshot at /v/<N>/.`
+      : `AGENT API PASS for "${project.name}". Changes land in your own branch; owner reviews and publishes.`,
+    conversation_tone: { mode: 'friendly, builder-energy', emoji_policy: 'sparing', response_length: 'short' },
+    on_first_load: { summary: project ? `Check ${apiBase}/project/info + files + history and greet based on state.` : 'Greet warmly, offer overview.' },
+    transport: 'Try built-in HTTP tools first; on failure switch to Claude for Chrome silently.',
+    capabilities: isSAP ? ['list_projects','create_project','delete_project','revoke_passes','configure_github_default','manage_telepath_bot']
+      : isPAP ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','github_autosync','attach_telegram_bot','set_bot_webhook_url','view_bot_analytics']
+      : ['build_in_branch','read_live','read_history'],
+    endpoints: isSAP ? [
+      { method: 'GET', path: '/projects' },
+      { method: 'POST', path: '/projects', body: '{name, description?, github_repo?}' },
+      { method: 'DELETE', path: '/projects/:name' },
+      { method: 'GET', path: '/tap' },
+      { method: 'PUT', path: '/tap', body: '{token}' },
+      { method: 'DELETE', path: '/tap' },
+    ] : isPAP ? [
+      { method: 'GET', path: '/project/info' },
+      { method: 'GET', path: '/project/versions' },
+      { method: 'POST', path: '/upload', body: '{filename, content}' },
+      { method: 'POST', path: '/commit', body: '{message?}' },
+      { method: 'POST', path: '/promote' },
+      { method: 'POST', path: '/rollback', body: '{commit_or_version}' },
+      { method: 'POST', path: '/aaps', body: '{name?}' },
+      { method: 'POST', path: '/merge', body: '{aap_id}' },
+    ] : [
+      { method: 'POST', path: '/upload', body: '{filename, content}' },
+      { method: 'POST', path: '/commit' },
+      { method: 'GET', path: '/files' },
+    ],
     branching: project ? {
-      main_branch: 'main',
-      aap_branch_format: 'aap/<aap_id>',
-      how_writes_flow: tier === 'aap'
-        ? 'Every upload from this AAP auto-switches to the aap/<your-id> branch and writes there.'
-        : 'PAP writes to main directly. AAP uploads live in aap/<their-id> branches. PAP merges them into main before promoting.',
-      promote: 'Only PAP (or SAP) can promote main -> live.',
+      main: 'main',
+      aap_format: 'aap/<id>',
+      versioning: 'Every commit on main produces /<n>/v/<N>/. Immutable snapshots.',
     } : null,
   };
 
-  // HTML welcome page
   const welcomeH1 = isSAP ? 'Server link' : project.name;
-  const subline   = isSAP
-    ? 'Root access to this drafts server. Paste this URL into any Claude chat and start shipping.'
+  const subline = isSAP
+    ? 'Root access. Paste into Claude.'
     : isPAP
-    ? `Your project on drafts. Paste this URL into Claude for Chrome and just talk. Say what you want to build — it ships. Invite collaborators, merge their work, publish, roll back. No registration, no coding, just vibe.`
-    : `You have been invited to contribute to ${project.name} on drafts. Paste this URL into Claude for Chrome and just talk — say what you want to build and it ships to your own branch. The project owner reviews and publishes. No registration, no coding, just vibe.`;
+    ? `Your project. Live at ${PUBLIC_BASE}/${project.name}/. ${versions.length} versions.`
+    : `Contributor link to ${project.name}. Your changes go to your own branch.`;
 
-  const warningLine = isPAP
-    ? 'This is YOUR project link. Keep it private. To invite someone, tell Claude "invite Alice" — it creates a separate link for her.'
-    : isAAP
-    ? 'This is YOUR contributor link to a shared project. Keep it private. Your changes land in your own branch — the owner reviews and publishes.'
-    : 'Treat this as server root. Never share.';
-
-  const publicLine  = project
-    ? 'Everything you publish lives at a public URL. Do not put secrets or personal data into files — write code and content, not credentials.'
-    : 'Projects published from this server all appear in the public gallery.';
+  let tapSection = '';
+  if (isSAP) {
+    tapSection = renderTapSection(tpStatus, token);
+  }
 
   let html = '';
-  html += '<!doctype html><html lang="en"><head>';
-  html += '<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>';
-  html += `<title>${title}</title>`;
-  html += '<meta name="robots" content="noindex,nofollow"/>';
-  html += '<style>';
-  html += '*{box-sizing:border-box;margin:0;padding:0}';
-  html += ':root{--bg:#000;--card:#0c0c0c;--border:rgba(255,255,255,0.07);--text:#f5f5f5;--text-2:#a8a8a8;--text-3:#6a6a6a;--green:#4ade80;--warn:#f59e0b;--blue:#60a5fa;--accent:#ea5a2e}';
-  html += 'html,body{background:var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,system-ui,sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;min-height:100vh}';
-  html += 'a{color:var(--blue);text-decoration:underline;text-decoration-color:rgba(96,165,250,0.3)}a:hover{text-decoration-color:var(--blue)}';
-  html += '.wrap{max-width:720px;margin:0 auto;padding:64px 28px 96px}';
-  html += '.eyebrow{display:inline-flex;align-items:center;gap:8px;font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:var(--text-3);margin-bottom:18px}';
-  html += `.eyebrow .dot{width:6px;height:6px;border-radius:50%;background:${isSAP?'var(--warn)':isPAP?'var(--accent)':'var(--green)'}}`;
-  html += 'h1{font-size:44px;font-weight:800;letter-spacing:-0.03em;line-height:1.05;margin-bottom:14px}';
-  html += '.lead{font-size:17px;color:var(--text-2);margin-bottom:28px;max-width:620px}';
-  html += '.badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;border:1px solid var(--border);background:rgba(255,255,255,0.04);color:var(--text-2);margin-bottom:14px}';
-  html += '.warn{background:rgba(245,158,11,0.06);border:1px solid rgba(245,158,11,0.18);border-radius:12px;padding:14px 18px;margin:14px 0;font-size:13.5px;color:var(--text-2)}';
-  html += '.warn strong{color:#fbbf24}';
-  html += '.note{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 18px;margin:14px 0;font-size:13.5px;color:var(--text-2)}';
-  html += '.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}';
-  html += '@media(max-width:640px){.grid{grid-template-columns:1fr}}';
-  html += '.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;display:flex;flex-direction:column}';
-  html += '.card .hd{display:flex;gap:10px;align-items:center;margin-bottom:12px}';
-  html += '.card .ic{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:18px}';
-  html += '.card.a .ic{background:linear-gradient(135deg,#ea5a2e,#d44a2a)}';
-  html += '.card.b .ic{background:rgba(96,165,250,0.12);color:#93c5fd;border:1px solid rgba(96,165,250,0.3)}';
-  html += '.card .t{font-size:15px;font-weight:700;letter-spacing:-0.01em}';
-  html += '.card .s{font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.06em;margin-top:1px}';
-  html += '.card p{font-size:13.5px;color:var(--text-2);line-height:1.55;margin-bottom:14px;flex:1}';
-  html += '.card .stp{font-size:12.5px;color:var(--text-3);line-height:1.7;margin-bottom:14px}';
-  html += '.card .stp b{color:var(--text-2);font-weight:500}';
-  html += '.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:11px 14px;border-radius:10px;font-size:13.5px;font-weight:600;cursor:pointer;font-family:inherit;letter-spacing:-0.005em;border:none;text-decoration:none;transition:transform 0.1s;width:100%}';
-  html += '.card.a .btn{background:linear-gradient(135deg,#ea5a2e,#d44a2a);color:#fff}';
-  html += '.card.a .btn:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(234,90,46,0.3)}';
-  html += '.card.b .btn{background:rgba(96,165,250,0.1);color:#93c5fd;border:1px solid rgba(96,165,250,0.25)}';
-  html += '.card.b .btn:hover{background:rgba(96,165,250,0.15);color:#bfdbfe}';
-  html += '.meta{margin-top:28px;padding-top:22px;border-top:1px solid var(--border);font-size:12px;color:var(--text-3);display:flex;gap:20px;flex-wrap:wrap}';
-  html += '.meta a{color:var(--text-2)}';
+  html += '<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>';
+  html += `<title>${title}</title><meta name="robots" content="noindex,nofollow"/>`;
+  html += '<style>*{box-sizing:border-box;margin:0;padding:0}body{background:#000;color:#f5f5f5;font-family:Inter,system-ui,sans-serif;font-size:15px;line-height:1.6}';
+  html += 'a{color:#60a5fa}.wrap{max-width:720px;margin:0 auto;padding:64px 28px}';
+  html += 'h1{font-size:44px;font-weight:800;letter-spacing:-0.03em;margin-bottom:14px}';
+  html += '.lead{font-size:17px;color:#a8a8a8;margin-bottom:28px}.badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;border:1px solid rgba(255,255,255,0.07);color:#a8a8a8;margin-bottom:14px}';
+  html += '.btn{display:inline-block;padding:11px 20px;border-radius:10px;background:#ea5a2e;color:#fff;text-decoration:none;font-weight:600;margin-right:10px;margin-top:14px}';
+  html += '.meta{margin-top:28px;font-size:12px;color:#6a6a6a}.meta a{color:#a8a8a8}';
   html += '</style></head><body><div class="wrap">';
-
-  html += `<div class="eyebrow"><span class="dot"></span> ${isSAP ? 'server api pass' : isPAP ? 'project api pass' : 'agent api pass'}</div>`;
-  html += `<span class="badge">${roleBadge}</span>`;
-  html += `<h1 style="margin-top:10px">${welcomeH1}</h1>`;
-  html += `<p class="lead">${subline}</p>`;
+  html += `<span class="badge">${roleBadge}</span><h1>${welcomeH1}</h1><p class="lead">${subline}</p>`;
   html += buildRichContext({ tier, token, project, projectsDir: DRAFTS_DIR, publicBase: PUBLIC_BASE });
-
-  html += `<div class="warn"><strong>Keep it safe.</strong> ${warningLine}</div>`;
-  if (project) html += `<div class="note">${publicLine}</div>`;
-
-  html += '<div class="grid">';
-  html += '<div class="card a">';
-  html += '<div class="hd"><div class="ic">✨</div><div><div class="t">Open in Claude for Chrome</div><div class="s">chrome extension</div></div></div>';
-  html += '<p>Install the extension, come back, click the Claude icon in your toolbar. It reads this page and you talk side-by-side.</p>';
-  html += '<div class="stp"><b>1.</b> Install → <b>2.</b> Reload → <b>3.</b> Click the Claude icon</div>';
-  html += `<a class="btn" href="${CHROME_EXT_URL}" target="_blank" rel="noopener">Install Claude for Chrome ↗</a>`;
-  html += '</div>';
-
-  html += '<div class="card b">';
-  html += '<div class="hd"><div class="ic">💬</div><div><div class="t">Or: Claude.ai / Desktop</div><div class="s">any chat</div></div></div>';
-  html += '<p>Copy this URL, paste it into any Claude chat. Tell it what to build — it opens the link when needed.</p>';
-  html += '<div class="stp"><b>1.</b> Copy URL → <b>2.</b> Paste in chat → <b>3.</b> Just talk</div>';
-  html += '<button class="btn" id="copyUrlBtn" type="button" data-portable="' + portableId + '">Copy portable link</button>';
-  html += '</div>';
-  html += '</div>';
-
+  html += tapSection;
+  html += `<a class="btn" href="${CHROME_EXT_URL}" target="_blank">Install Claude for Chrome ↗</a>`;
+  html += `<button class="btn" id="copyUrlBtn" type="button" data-portable="${portableId}" style="background:rgba(96,165,250,0.15);border:none;color:#93c5fd;cursor:pointer;font-family:inherit;font-size:14px">Copy link</button>`;
   if (project) {
     html += '<div class="meta">';
-    html += `<span><a href="${liveUrl}" target="_blank">live ↗</a></span>`;
-    html += `<span><a href="${draftsView}" target="_blank">drafts preview ↗</a></span>`;
-    html += `<span><a href="${PUBLIC_BASE}/drafts/about/" target="_blank">about drafts ↗</a></span>`;
+    html += `<a href="${liveUrl}" target="_blank">live ↗</a>`;
+    if (latestVersionUrl) html += ` · <a href="${latestVersionUrl}" target="_blank">v${latestVersion} ↗</a>`;
     html += '</div>';
-  } else {
-    html += '<div class="meta">';
-    html += `<span><a href="${PUBLIC_BASE}/drafts/" target="_blank">public gallery ↗</a></span>`;
-    html += `<span><a href="${PUBLIC_BASE}/drafts/about/" target="_blank">about ↗</a></span>`;
+  }
+  html += '<script>(function(){var b=document.getElementById("copyUrlBtn");if(!b)return;b.addEventListener("click",function(){navigator.clipboard.writeText(b.dataset.portable);b.textContent="Copied ✓";setTimeout(function(){b.textContent="Copy link"},1500);});})();</script>';
+  html += '<script type="application/json" id="claude-instructions">' + JSON.stringify(machine, null, 2) + '</' + 'script>';
+  
+  // v0.9 UI: Telepath button (top-right), Autopilot module (PAP), Auto-update (SAP)
+  html += '<style>';
+  html += '.v9-topbar{position:fixed;top:18px;right:22px;display:flex;gap:8px;z-index:50}';
+  html += '.v9-btn{background:rgba(255,255,255,0.06);border:1px solid var(--border);color:var(--text-2);padding:8px 14px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;letter-spacing:0.02em}';
+  html += '.v9-btn:hover{background:rgba(255,255,255,0.10);color:var(--text)}';
+  html += '.v9-btn.tg{background:linear-gradient(135deg,#229ED9,#1a7ba8);color:#fff;border-color:transparent}';
+  html += '.v9-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:100;align-items:flex-start;justify-content:center;padding:60px 20px;overflow-y:auto}';
+  html += '.v9-modal.open{display:flex}';
+  html += '.v9-card{background:#0c0c0c;border:1px solid var(--border);border-radius:16px;padding:32px;max-width:560px;width:100%;color:var(--text)}';
+  html += '.v9-card h2{font-size:24px;font-weight:800;letter-spacing:-0.02em;margin-bottom:8px}';
+  html += '.v9-card .sub{color:var(--text-2);font-size:14px;margin-bottom:20px}';
+  html += '.v9-card .field{margin:14px 0}';
+  html += '.v9-card label{display:block;font-size:12px;color:var(--text-3);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px}';
+  html += '.v9-card input[type=text],.v9-card input[type=password],.v9-card textarea{width:100%;background:#000;border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-family:inherit;font-size:13.5px;box-sizing:border-box}';
+  html += '.v9-card .row{display:flex;gap:10px;align-items:center;margin:10px 0}';
+  html += '.v9-card .check{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px;margin:8px 0;cursor:pointer}';
+  html += '.v9-card .check:hover{background:rgba(255,255,255,0.05)}';
+  html += '.v9-card .check input{margin-top:3px}';
+  html += '.v9-card .check .ttl{font-weight:600;font-size:14px;margin-bottom:3px}';
+  html += '.v9-card .check .ds{font-size:12.5px;color:var(--text-2);line-height:1.5}';
+  html += '.v9-card .actions{display:flex;gap:10px;margin-top:20px;justify-content:flex-end}';
+  html += '.v9-prim{background:linear-gradient(135deg,#ea5a2e,#d44a2a);color:#fff;border:none;padding:10px 18px;border-radius:8px;font-weight:600;cursor:pointer;font-size:13.5px}';
+  html += '.v9-sec{background:transparent;color:var(--text-2);border:1px solid var(--border);padding:10px 18px;border-radius:8px;font-weight:600;cursor:pointer;font-size:13.5px}';
+  html += '.v9-status{font-size:12px;color:var(--text-3);margin-top:8px;font-family:var(--mono,monospace)}';
+  html += '.v9-status.ok{color:#4ade80}.v9-status.err{color:#f87171}';
+  html += '.v9-section{background:#0c0c0c;border:1px solid var(--border);border-radius:14px;padding:20px;margin:20px 0}';
+  html += '.v9-section h3{font-size:15px;font-weight:700;letter-spacing:-0.01em;margin-bottom:6px;display:flex;align-items:center;gap:8px}';
+  html += '.v9-section .badge2{background:rgba(74,222,128,0.15);color:#4ade80;font-size:10px;padding:2px 8px;border-radius:4px;letter-spacing:0.06em;text-transform:uppercase;font-weight:600}';
+  html += '.v9-section p{font-size:13px;color:var(--text-2);line-height:1.55;margin-bottom:14px}';
+  html += '</style>';
+
+  // Top bar with Telepath + (SAP) Auto-update buttons
+  html += '<div class="v9-topbar">';
+  if (isSAP) {
+    html += '<button class="v9-btn" onclick="document.getElementById(\'v9-update\').classList.add(\'open\')"> Auto-update</button>';
+  }
+  html += '<button class="v9-btn tg" onclick="document.getElementById(\'v9-telepath\').classList.add(\'open\')"> Telepath</button>';
+  html += '</div>';
+
+  // Telepath modal (visible on SAP and PAP)
+  if (isSAP || isPAP) {
+    const tg = (typeof telepathState !== 'undefined' && telepathState) ? telepathState : null;
+    const installed = tg && tg.installed;
+    html += '<div class="v9-modal" id="v9-telepath">';
+    html += '<div class="v9-card">';
+    html += '<h2> Telepath</h2>';
+    html += '<p class="sub">One Telegram bot, all your projects. Push changes from anywhere  phone, desktop, voice. Telepath connects your drafts server to a Telegram bot, giving you mobile-first control over every project on this server. Each PAP gets its own per-project bot persona; SAP owner gets the master bot.</p>';
+    if (installed) {
+      html += '<div class="v9-section"><h3>Connected <span class="badge2">active</span></h3>';
+      html += '<p>Bot: <b>@' + (tg.bot && tg.bot.username || '?') + '</b> &nbsp; Polling: <b>' + (tg.polling?'on':'off') + '</b></p>';
+      html += '<p>Open the bot in Telegram and send <code>/start</code>. Use <code>/projects</code> to see everything on this server, <code>/sites</code> for project-bots management (similar to BotFather sites menu).</p>';
+      html += '<a href="https://t.me/' + (tg.bot && tg.bot.username || '') + '" target="_blank" class="v9-prim" style="text-decoration:none;display:inline-block">Open in Telegram </a>';
+      if (isSAP) html += ' <button class="v9-sec" id="v9-tap-revoke">Revoke</button>';
+      html += '</div>';
+    } else {
+      html += '<div class="v9-section"><h3>Set up Telegram bot</h3>';
+      html += '<p>1. Open <a href="https://t.me/BotFather" target="_blank">@BotFather</a> in Telegram, send <code>/newbot</code>, follow prompts. 2. Copy the bot token (looks like <code>1234567890:ABC</code>). 3. Paste below.</p>';
+      html += '<div class="field"><label>Telegram bot token</label><input type="password" id="v9-tap-token" placeholder="1234567890:AAB..."/></div>';
+      html += '<div class="actions"><button class="v9-sec" onclick="document.getElementById(\'v9-telepath\').classList.remove(\'open\')">Cancel</button><button class="v9-prim" id="v9-tap-install">Install Telepath</button></div>';
+      html += '<div class="v9-status" id="v9-tap-status"></div>';
+      html += '</div>';
+    }
+    html += '<div class="actions"><button class="v9-sec" onclick="document.getElementById(\'v9-telepath\').classList.remove(\'open\')">Close</button></div>';
+    html += '</div></div>';
+  }
+
+  // Auto-update modal (SAP only)
+  if (isSAP) {
+    html += '<div class="v9-modal" id="v9-update">';
+    html += '<div class="v9-card">';
+    html += '<h2> Auto-update software</h2>';
+    html += '<p class="sub">Pull latest drafts and Telepath code from GitHub on a schedule. Server stays current automatically.</p>';
+    html += '<label class="check"><input type="checkbox" id="v9-up-drafts"/><div><div class="ttl">Auto-update drafts to latest version</div><div class="ds">Pulls from <code>github.com/g0rd33v/drafts-protocol</code> daily. Restarts pm2 process after a successful pull. Skips if working tree is dirty.</div></div></label>';
+    html += '<label class="check"><input type="checkbox" id="v9-up-telepath"/><div><div class="ttl">Auto-update Telepath to latest version</div><div class="ds">Updates the Telepath module embedded in drafts. Requires Telepath to be installed (TAP set). Same daily cadence.</div></div></label>';
+    html += '<div class="actions"><button class="v9-sec" onclick="document.getElementById(\'v9-update\').classList.remove(\'open\')">Cancel</button><button class="v9-prim" id="v9-up-save">Save</button></div>';
+    html += '<div class="v9-status" id="v9-up-status"></div>';
+    html += '</div></div>';
+  }
+
+  // Autopilot section (PAP/AAP  inline on the page, not a modal)
+  if (isPAP || isAAP) {
+    html += '<div class="v9-section"><h3> Autopilot <span class="badge2">create-test-fix</span></h3>';
+    html += '<p>Describe what you want and Autopilot ships it on a loop: it generates a draft, your Claude for Chrome agent tests it in a real browser, fixes whatever broke, and repeats until the build is green. No babysitting.</p>';
+    html += '<div class="field"><label>Goal</label><textarea id="v9-ap-goal" rows="3" placeholder="e.g. landing page for a vintage typewriter shop in Brooklyn  hero, gallery, contact form, mobile-first"></textarea></div>';
+    html += '<div class="row"><label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);text-transform:none;letter-spacing:0"><input type="checkbox" id="v9-ap-loop" checked/> Run as loop until tests pass</label></div>';
+    html += '<div class="actions"><button class="v9-prim" id="v9-ap-start">Start autopilot</button></div>';
+    html += '<div class="v9-status" id="v9-ap-status"></div>';
     html += '</div>';
   }
 
-  html += '<script>(function(){var b=document.getElementById("copyUrlBtn");if(!b)return;b.addEventListener("click",function(){navigator.clipboard.writeText(b.dataset.portable);b.textContent="Copied ✓";setTimeout(function(){b.textContent="Copy portable link"},1500);});})();</script>';
+  // Wire up scripts for v0.9 UI
+  html += '<script>(function(){';
+  html += 'var T=' + JSON.stringify(token) + ';';
+  html += 'var API=' + JSON.stringify(apiBase) + ';';
+  html += 'function st(id,m,k){var e=document.getElementById(id);if(!e)return;e.textContent=m||"";e.className="v9-status"+(k?" "+k:"")}';
+  html += 'var ti=document.getElementById("v9-tap-install");if(ti)ti.addEventListener("click",function(){var tk=document.getElementById("v9-tap-token").value.trim();if(!tk){st("v9-tap-status","token required","err");return}st("v9-tap-status","installing...");fetch(API+"/tap",{method:"PUT",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({token:tk})}).then(function(r){return r.json()}).then(function(d){if(d.ok){st("v9-tap-status","installed: @"+(d.bot&&d.bot.username),"ok");setTimeout(function(){location.reload()},900)}else st("v9-tap-status","error: "+d.error,"err")}).catch(function(e){st("v9-tap-status","error: "+e.message,"err")})});';
+  html += 'var tr=document.getElementById("v9-tap-revoke");if(tr)tr.addEventListener("click",function(){if(!confirm("Revoke Telepath?"))return;fetch(API+"/tap",{method:"DELETE",headers:{"Authorization":"Bearer "+T}}).then(function(){location.reload()})});';
+  html += 'var us=document.getElementById("v9-up-save");if(us){fetch(API+"/autoupdate",{headers:{"Authorization":"Bearer "+T}}).then(function(r){return r.json()}).then(function(d){if(d.ok){var a=document.getElementById("v9-up-drafts");if(a)a.checked=!!d.drafts;var b=document.getElementById("v9-up-telepath");if(b)b.checked=!!d.telepath}});us.addEventListener("click",function(){var d=document.getElementById("v9-up-drafts").checked;var tp=document.getElementById("v9-up-telepath").checked;st("v9-up-status","saving...");fetch(API+"/autoupdate",{method:"PUT",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({drafts:d,telepath:tp})}).then(function(r){return r.json()}).then(function(x){st("v9-up-status",x.ok?"saved":"err: "+x.error,x.ok?"ok":"err")})})}';
+  html += 'var ap=document.getElementById("v9-ap-start");if(ap)ap.addEventListener("click",function(){var g=document.getElementById("v9-ap-goal").value.trim();if(!g){st("v9-ap-status","goal required","err");return}st("v9-ap-status","queued. Open this page in Claude for Chrome  agent will pick up the autopilot job and run create-test-fix loop.");fetch(API+"/autopilot",{method:"POST",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({goal:g,loop:document.getElementById("v9-ap-loop").checked})}).then(function(r){return r.json()}).then(function(d){if(d.ok)st("v9-ap-status","job "+d.job_id+" queued  autopilot loop active","ok");else st("v9-ap-status","err: "+d.error,"err")})});';
+  html += '})();</script>';
 
-  html += '<!--CLAUDE-INSTRUCTIONS-START-->';
-  html += '<script type="application/json" id="claude-instructions">';
-  html += JSON.stringify(machine, null, 2);
-  html += '</' + 'script>';
-  html += '</div>';
-  html += '</body></html>';
+  html += '</div></body></html>';
   return html;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Welcome routes
-// ─────────────────────────────────────────────────────────────
-
-function welcomeHandler(expectedTier) {
-  return (req, res) => {
-    const token = req.params.token || '';
-    if (!token) return res.status(400).send('missing token');
-    if (expectedTier === 'sap') {
-      if (token !== SAP_TOKEN) return res.status(404).send('not found');
-      return res.type('html').send(renderPage({ tier: 'sap', token }));
-    }
-    if (expectedTier === 'pap') {
-      const p = findProjectByPAP(token);
-      if (!p) return res.status(404).send('not found');
-      return res.type('html').send(renderPage({ tier: 'pap', token, project: p }));
-    }
-    if (expectedTier === 'aap') {
-      const hit = findProjectAndAAPByAAPToken(token);
-      if (!hit) return res.status(404).send('not found');
-      return res.type('html').send(renderPage({ tier: 'aap', token, project: hit.project, aap: hit.aap }));
-    }
-  };
+function renderTapSection(tpStatus, sapToken) {
+  let inner;
+  if (tpStatus.installed && tpStatus.bot) {
+    inner = `
+      <div style="font-size:13px;color:#a8a8a8;margin-bottom:8px">Connected as <strong style="color:#f5f5f5">@${tpStatus.bot.username}</strong> · polling: ${tpStatus.polling ? '<span style="color:#4ade80">on</span>' : '<span style="color:#ea5a2e">off</span>'}</div>
+      <div style="font-size:12px;color:#6a6a6a;margin-bottom:14px">Open the bot in Telegram → send your SAP/PAP/AAP token → get a dashboard.</div>
+      <button id="tapDisconnect" type="button" style="padding:8px 14px;border-radius:8px;background:transparent;border:1px solid rgba(234,90,46,0.4);color:#ea5a2e;font-weight:600;font-size:12px;cursor:pointer">Disconnect bot</button>
+    `;
+  } else {
+    inner = `
+      <div style="font-size:13px;color:#a8a8a8;margin-bottom:14px">Drafts Telepath isn't connected to a bot yet. Create a bot via <a href="https://t.me/BotFather" target="_blank" style="color:#60a5fa">@BotFather</a> on Telegram, then paste its API token below to bring this server's data into your DM.</div>
+      <input id="tapTokenInput" type="password" placeholder="123456789:AA..." style="width:100%;padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:#000;color:#f5f5f5;font-family:ui-monospace,Menlo,monospace;font-size:13px;box-sizing:border-box;margin-bottom:10px"/>
+      <button id="tapInstall" type="button" style="padding:10px 18px;border-radius:8px;background:#ea5a2e;border:none;color:#fff;font-weight:600;font-size:13px;cursor:pointer">Connect bot</button>
+      <div id="tapStatus" style="margin-top:10px;font-size:12px;color:#6a6a6a"></div>
+    `;
+  }
+  return `
+    <div style="background:#0c0c0c;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:20px 22px;margin:28px 0;">
+      <h3 style="font-size:11px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#6a6a6a;margin:0 0 14px 0;">
+        <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${tpStatus.installed ? '#4ade80' : '#6a6a6a'};margin-right:8px;vertical-align:middle"></span>
+        Telepath · Telegram bot
+      </h3>
+      ${inner}
+    </div>
+    <script>
+    (function(){
+      var sap = ${JSON.stringify(sapToken)};
+      var hdr = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + sap };
+      var btnI = document.getElementById('tapInstall');
+      if (btnI) {
+        btnI.addEventListener('click', function() {
+          var tok = (document.getElementById('tapTokenInput').value || '').trim();
+          var status = document.getElementById('tapStatus');
+          if (!/^\\d+:[A-Za-z0-9_-]{30,}$/.test(tok)) { status.textContent = 'Invalid token format. It should look like 1234567:AA...'; status.style.color='#ea5a2e'; return; }
+          status.textContent = 'Verifying with Telegram...'; status.style.color='#a8a8a8';
+          fetch('/drafts/tap', { method:'PUT', headers: hdr, body: JSON.stringify({ token: tok }) })
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+              if (j.ok) { status.textContent = 'Connected as @' + j.bot.username + '. Reload to see status.'; status.style.color='#4ade80'; setTimeout(function(){ location.reload(); }, 1500); }
+              else { status.textContent = 'Failed: ' + (j.detail || j.error); status.style.color='#ea5a2e'; }
+            })
+            .catch(function(e){ status.textContent = 'Network error: ' + e.message; status.style.color='#ea5a2e'; });
+        });
+      }
+      var btnD = document.getElementById('tapDisconnect');
+      if (btnD) {
+        btnD.addEventListener('click', function() {
+          if (!confirm('Disconnect bot? Users will lose access until you reconnect.')) return;
+          fetch('/drafts/tap', { method:'DELETE', headers: hdr })
+            .then(function(){ location.reload(); });
+        });
+      }
+    })();
+    </script>
+  `;
 }
 
-// Unified canonical welcome — accepts portable form drafts_<tier>_<N>_<hex> or raw internal token
-function unifiedWelcome(req, res) {
+async function welcomeRoute(req, res) {
   let token = req.params.token || "";
   const portable = token.match(/^drafts_(server|project|agent)_(\d+)_([a-f0-9]+)$/i);
   if (portable) {
@@ -591,59 +741,49 @@ function unifiedWelcome(req, res) {
   else if (token.startsWith("aap_")) tier = "aap";
   else if (/^[0-9a-f]{12,64}$/i.test(token)) tier = "sap";
   else return res.status(404).send("not found");
-  req.params.token = token;
-  return welcomeHandler(tier)(req, res);
+
+  if (tier === 'sap') {
+    if (token !== SAP_TOKEN) return res.status(404).send('not found');
+    return res.type('html').send(renderPage({ tier: 'sap', token }));
+  }
+  if (tier === 'pap') {
+    const p = findProjectByPAP(token);
+    if (!p) return res.status(404).send('not found');
+    const versions = await listVersions(p.name);
+    return res.type('html').send(renderPage({ tier: 'pap', token, project: p, versions }));
+  }
+  if (tier === 'aap') {
+    const hit = findProjectAndAAPByAAPToken(token);
+    if (!hit) return res.status(404).send('not found');
+    const versions = await listVersions(hit.project.name);
+    return res.type('html').send(renderPage({ tier: 'aap', token, project: hit.project, aap: hit.aap, versions }));
+  }
 }
 
-app.get('/drafts/pass/:token', unifiedWelcome);
+app.get('/drafts/pass/:token', welcomeRoute);
 
-// Legacy short-form drafts_<tier>_<N>_<hex> at root → 302 to canonical
-app.get(/^\/drafts_(server|project|agent)_(\d+)_([a-f0-9]+)$/i, (req, res) => {
-  const tier = req.params[0].toLowerCase();
-  const secret = req.params[2];
-  let internalToken;
-  if (tier === "server") internalToken = secret;
-  else if (tier === "project") internalToken = "pap_" + secret;
-  else if (tier === "agent") internalToken = "aap_" + secret;
-  else return res.status(404).send("unknown tier");
-  return res.redirect(302, "/drafts/pass/" + internalToken);
-});
-
-// Legacy v1 short links — gone-link page
 app.get('/m/:token', (req, res) => {
-  return res.status(410).type('html').send(
-    '<h1>This link has expired</h1>' +
-    '<p>Drafts was upgraded. Ask the server owner for a fresh link.</p>'
-  );
+  return res.status(410).type('html').send('<h1>This link has expired</h1><p>Drafts was upgraded. Ask the server owner for a fresh link.</p>');
 });
-
-
-// ─────────────────────────────────────────────────────────────
-// WHOAMI
-// ─────────────────────────────────────────────────────────────
 
 app.get('/drafts/whoami', authAny, (req, res) => {
   if (req.tier === 'sap') return res.json({ ok: true, tier: 'sap', total_projects: state.projects.length });
-  if (req.tier === 'pap') return res.json({ ok: true, tier: 'pap', project: req.project.name, aaps: (req.project.aaps||[]).filter(a=>!a.revoked).length });
+  if (req.tier === 'pap') return res.json({ ok: true, tier: 'pap', project: req.project.name });
   return res.json({ ok: true, tier: 'aap', project: req.project.name, agent: req.aap.name || 'unnamed', branch: req.aap.branch });
 });
 
-// ─────────────────────────────────────────────────────────────
-// SAP endpoints
-// ─────────────────────────────────────────────────────────────
-
 app.get('/drafts/server/stats', authSAP, (req, res) => {
   res.json({
-    ok: true,
-    server_number: SERVER_NUMBER,
-    total_projects: state.projects.length,
+    ok: true, server_number: SERVER_NUMBER, total_projects: state.projects.length,
     github_default_configured: !!(state.github_default && state.github_default.token),
+    telepath: getTelepathStatus(),
     projects: state.projects.map(p => ({
-      name: p.name,
-      description: p.description,
-      created_at: p.created_at,
-      pap_revoked: p.pap?.revoked || false,
+      name: p.name, created_at: p.created_at,
       aap_count: (p.aaps || []).filter(a => !a.revoked).length,
+      bot_attached: !!(p.bot && p.bot.token),
+      bot_mode: p.bot && p.bot.token ? (p.bot.webhook_url ? 'webhook' : 'default') : null,
+      analytics_enabled: p.bot && p.bot.token ? (p.bot.analytics_enabled !== false) : null,
+      github_autosync: !!p.github_autosync,
     })),
   });
 });
@@ -652,44 +792,35 @@ app.get('/drafts/projects', authSAP, (req, res) => {
   res.json({
     ok: true,
     projects: state.projects.map(p => ({
-      name: p.name,
-      description: p.description,
-      github_repo: p.github_repo,
-      github_config_overridden: !!(p.github_config && p.github_config.token),
-      created_at: p.created_at,
-      pap: p.pap ? { id: p.pap.id, name: p.pap.name, revoked: p.pap.revoked, activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${p.pap.token.replace(/^pap_/,'')}` } : null,
-      aaps: (p.aaps || []).map(a => ({ id: a.id, name: a.name, revoked: a.revoked, created_at: a.created_at })),
+      name: p.name, description: p.description, github_repo: p.github_repo, github_autosync: !!p.github_autosync,
+      created_at: p.created_at, live_url: `${PUBLIC_BASE}/${p.name}/`,
+      pap: p.pap ? { id: p.pap.id, revoked: p.pap.revoked, activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${p.pap.token.replace(/^pap_/,'')}` } : null,
+      aaps: (p.aaps || []).map(a => ({ id: a.id, name: a.name, revoked: a.revoked })),
+      bot: p.bot ? {
+        bot_username: p.bot.bot_username,
+        subscriber_count: (p.bot.subscribers || []).length,
+        last_synced_at: p.bot.last_synced_at,
+        mode: p.bot.webhook_url ? 'webhook' : 'default',
+        webhook_url: p.bot.webhook_url || null,
+        analytics_enabled: p.bot.analytics_enabled !== false,
+      } : null,
     })),
   });
 });
 
 app.post('/drafts/projects', authSAP, async (req, res) => {
-  const name = sanitizeName(req.body.name);
-  if (!name) return res.status(400).json({ ok: false, error: 'invalid_name' });
-  if (findProjectByName(name)) return res.status(409).json({ ok: false, error: 'exists' });
-
-  const pap = { id: newId(), token: newToken('pap'), name: req.body.pap_name || null, created_at: now(), revoked: false };
-  const proj = {
-    name,
-    description: req.body.description || '',
-    github_repo: req.body.github_repo || null,
-    created_at: now(),
-    pap,
-    aaps: [],
-  };
-  state.projects.push(proj);
-  saveState();
-  await ensureProjectDirs(name);
-  await createPublicSymlinks(name);
-
-  const papSecret = pap.token.replace(/^pap_/, '');
-  res.json({
-    ok: true,
-    project: name,
-    pap_activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_project_${SERVER_NUMBER}_${papSecret}`,
-    live_url: `${PUBLIC_BASE}/live/${name}/`,
-    drafts_view_url: `${PUBLIC_BASE}/drafts-view/${name}/`,
-  });
+  try {
+    const out = await _createProjectInternal({
+      name: req.body.name,
+      description: req.body.description || '',
+      github_repo: req.body.github_repo || null,
+      pap_name: req.body.pap_name || null,
+    });
+    res.json({ ok: true, project: out.project, pap_activation_url: out.pap_activation_url, live_url: out.live_url });
+  } catch (e) {
+    const code = e.message === 'invalid_name' ? 400 : e.message === 'reserved_name' ? 400 : e.message === 'exists' ? 409 : 500;
+    res.status(code).json({ ok: false, error: e.message });
+  }
 });
 
 app.delete('/drafts/projects/:name', authSAP, async (req, res) => {
@@ -698,7 +829,6 @@ app.delete('/drafts/projects/:name', authSAP, async (req, res) => {
   if (!p) return res.status(404).json({ ok: false, error: 'not_found' });
   state.projects = state.projects.filter(x => x.name !== name);
   saveState();
-  removePublicSymlinks(name);
   try { execSync(`rm -rf "${projectPaths(name).root}"`); } catch (e) {}
   res.json({ ok: true, deleted: name });
 });
@@ -706,27 +836,20 @@ app.delete('/drafts/projects/:name', authSAP, async (req, res) => {
 app.delete('/drafts/projects/:name/pap', authSAP, (req, res) => {
   const p = findProjectByName(sanitizeName(req.params.name));
   if (!p || !p.pap) return res.status(404).json({ ok: false, error: 'not_found' });
-  p.pap.revoked = true;
-  saveState();
+  p.pap.revoked = true; saveState();
   res.json({ ok: true, revoked: p.pap.id });
 });
-
-// ─────────────────────────────────────────────────────────────
-// PAP endpoints (project-scoped)
-// ─────────────────────────────────────────────────────────────
 
 app.get('/drafts/project/info', authAny, (req, res) => {
   const p = req.project;
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
   res.json({
-    ok: true,
-    project: p.name,
-    description: p.description,
-    github_repo: p.github_repo,
-    created_at: p.created_at,
-    live_url: `${PUBLIC_BASE}/live/${p.name}/`,
-    drafts_view_url: `${PUBLIC_BASE}/drafts-view/${p.name}/`,
-    viewer_tier: req.tier,
+    ok: true, project: p.name, description: p.description, github_repo: p.github_repo, github_autosync: !!p.github_autosync,
+    created_at: p.created_at, live_url: `${PUBLIC_BASE}/${p.name}/`, viewer_tier: req.tier,
+    bot_attached: !!(p.bot && p.bot.token),
+    bot_username: p.bot?.bot_username || null,
+    bot_mode: p.bot && p.bot.token ? (p.bot.webhook_url ? 'webhook' : 'default') : null,
+    analytics_enabled: p.bot && p.bot.token ? (p.bot.analytics_enabled !== false) : null,
   });
 });
 
@@ -739,46 +862,62 @@ app.get('/drafts/project/stats', authPAPorSAP, async (req, res) => {
     const branches = await git.branch();
     const log = await git.log({ maxCount: 10 });
     const liveFiles = fs.existsSync(pp.live) ? fs.readdirSync(pp.live).filter(f=>!f.startsWith('.')) : [];
+    const versions = await listVersions(p.name);
     res.json({
-      ok: true,
-      project: p.name,
+      ok: true, project: p.name, live_url: `${PUBLIC_BASE}/${p.name}/`,
       aaps_active: (p.aaps || []).filter(a => !a.revoked).length,
-      aaps_total: (p.aaps || []).length,
       branches: branches.all,
       recent_commits: log.all.map(c => ({ hash: c.hash.slice(0,7), message: c.message, date: c.date })),
       live_files_count: liveFiles.length,
+      versions: { count: versions.length, latest: versions[versions.length - 1] || null, all: versions },
+      github_autosync: !!p.github_autosync,
+      bot: p.bot ? {
+        bot_username: p.bot.bot_username,
+        subscribers: (p.bot.subscribers || []).length,
+        last_synced_at: p.bot.last_synced_at,
+        mode: p.bot.webhook_url ? 'webhook' : 'default',
+        webhook_url: p.bot.webhook_url || null,
+        webhook_log_count: (p.bot.webhook_log || []).length,
+        analytics_enabled: p.bot.analytics_enabled !== false,
+      } : null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'stats_failed', detail: e.message });
   }
 });
 
-app.post('/drafts/aaps', authPAPorSAP, (req, res) => {
+app.get('/drafts/project/versions', authAny, async (req, res) => {
+  const p = req.project;
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  const pp = await ensureProjectDirs(p.name);
+  const versions = await listVersions(p.name);
+  let hashes = [];
+  try { hashes = execSync(`git -C "${pp.drafts}" rev-list main --reverse`).toString().trim().split('\n').filter(Boolean); } catch (e) {}
+  const out = [];
+  for (const N of versions) {
+    const hash = hashes[N];
+    let msg = null, date = null;
+    if (hash) {
+      try {
+        const line = execSync(`git -C "${pp.drafts}" show -s --format="%s|%aI" ${hash}`).toString().trim();
+        const [m, d] = line.split('|'); msg = m; date = d;
+      } catch (e) {}
+    }
+    out.push({ n: N, url: `${PUBLIC_BASE}/${p.name}/v/${N}/`, hash: hash ? hash.slice(0,7) : null, message: msg, date });
+  }
+  res.json({ ok: true, project: p.name, versions: out });
+});
+
+app.post('/drafts/aaps', authPAPorSAP, async (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.body.project || ''));
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
-  const aap = {
-    id: newId(),
-    token: newToken('aap'),
-    name: (req.body.name || '').toString().slice(0, 60) || null,
-    created_at: now(),
-    revoked: false,
-    branch: '',
-  };
-  aap.branch = `aap/${aap.id}`;
-  p.aaps = p.aaps || [];
-  p.aaps.push(aap);
-  saveState();
-
-  const aapSecret = aap.token.replace(/^aap_/, '');
-  const activationUrl = `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`;
+  const out = await _createAAPInternal(p, { name: req.body.name });
+  try { telepathHooks.onNewAAPCreated(p, out.aap); } catch (e) {}
   res.json({
     ok: true,
-    aap: { id: aap.id, name: aap.name, branch: aap.branch, created_at: aap.created_at },
-    activation_url: activationUrl,
-    email_draft_hint: {
-      subject: `You're invited to the "${p.name}" drafts project`,
-      body: `Hey,\n\nI've set up a drafts workspace for "${p.name}" and added you as a contributor.\n\nYour link (it's your key — keep it to yourself):\n${activationUrl}\n\nHow to use it:\n- Open Google Chrome, install Claude for Chrome if you don't have it: ${CHROME_EXT_URL}\n- Paste the link into the Claude side panel\n- Tell Claude what to build — it handles the code, versioning, everything.\n\nChanges you make land in your own branch. I review and publish. No dashboards, no terminals. Just chat.\n\nCheers,\n`
-    },
+    aap: out.aap,
+    activation_url: out.activation_url,
+    email_draft_hint: { subject: `You're invited to "${p.name}" on drafts`, body: `Hey,\n\nYour link: ${out.activation_url}\n\nLive: ${PUBLIC_BASE}/${p.name}/\n\nCheers,\n` },
   });
 });
 
@@ -792,21 +931,10 @@ app.get('/drafts/aaps', authPAPorSAP, async (req, res) => {
     const br = `aap/${a.id}`;
     let pending = 0;
     if (branches.includes(br)) {
-      try {
-        const log = await git.log({ from: 'main', to: br });
-        pending = log.total;
-      } catch (e) {}
+      try { const log = await git.log({ from: 'main', to: br }); pending = log.total; } catch (e) {}
     }
     const aapSecret = a.token.replace(/^aap_/, '');
-    return {
-      id: a.id,
-      name: a.name,
-      branch: br,
-      revoked: a.revoked,
-      created_at: a.created_at,
-      activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`,
-      pending_commits: pending,
-    };
+    return { id: a.id, name: a.name, branch: br, revoked: a.revoked, created_at: a.created_at, activation_url: `${PUBLIC_BASE}/drafts/pass/drafts_agent_${SERVER_NUMBER}_${aapSecret}`, pending_commits: pending };
   }));
   res.json({ ok: true, project: p.name, aaps });
 });
@@ -816,8 +944,7 @@ app.delete('/drafts/aaps/:id', authPAPorSAP, (req, res) => {
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
   const a = (p.aaps || []).find(x => x.id === req.params.id);
   if (!a) return res.status(404).json({ ok: false, error: 'not_found' });
-  a.revoked = true;
-  saveState();
+  a.revoked = true; saveState();
   res.json({ ok: true, revoked: a.id });
 });
 
@@ -835,13 +962,7 @@ app.get('/drafts/pending', authPAPorSAP, async (req, res) => {
     try {
       const log = await git.log({ from: 'main', to: br });
       if (log.total === 0) continue;
-      result.push({
-        aap_id: aap.id,
-        aap_name: aap.name,
-        branch: br,
-        commits: log.all.slice(0, 20).map(c => ({ hash: c.hash.slice(0,7), message: c.message, date: c.date })),
-        total_pending: log.total,
-      });
+      result.push({ aap_id: aap.id, aap_name: aap.name, branch: br, commits: log.all.slice(0, 20).map(c => ({ hash: c.hash.slice(0,7), message: c.message, date: c.date })), total_pending: log.total });
     } catch (e) {}
   }
   res.json({ ok: true, project: p.name, pending: result });
@@ -859,16 +980,17 @@ app.post('/drafts/merge', authPAPorSAP, async (req, res) => {
   try {
     await git.checkout('main');
     await git.merge([`aap/${aap.id}`, '--no-ff', '-m', `merge aap/${aap.name || aap.id}`]);
-    res.json({ ok: true, merged: aap.id, branch: `aap/${aap.id}` });
+    const N = await materializeVersion(p.name);
+    try { telepathHooks.onAAPMerged(p, aap, N); } catch (e) {}
+    // v0.8 autosync
+    if (p.github_autosync && p.github_repo) {
+      _githubSyncProject(p).catch(e => console.error('[autosync after merge] failed:', e.message));
+    }
+    res.json({ ok: true, merged: aap.id, branch: `aap/${aap.id}`, version: N, version_url: `${PUBLIC_BASE}/${p.name}/v/${N}/` });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'merge_failed', detail: e.message });
   }
 });
-
-
-// ─────────────────────────────────────────────────────────────
-// Shared: upload / commit / files / history / promote / rollback
-// ─────────────────────────────────────────────────────────────
 
 app.post('/drafts/upload', authAny, async (req, res) => {
   const p = req.project;
@@ -878,18 +1000,16 @@ app.post('/drafts/upload', authAny, async (req, res) => {
   const where = req.body.where === 'live' && req.tier !== 'aap' ? 'live' : 'drafts';
   const pp = await ensureProjectDirs(p.name);
   const root = where === 'live' ? pp.live : pp.drafts;
-
-  if (req.tier === 'aap') {
-    const git = simpleGit(pp.drafts);
-    await switchToBranch(git, req.aap.branch);
-  } else {
-    const git = simpleGit(pp.drafts);
-    await switchToBranch(git, 'main');
-  }
-
+  const git = simpleGit(pp.drafts);
+  if (req.tier === 'aap') await switchToBranch(git, req.aap.branch);
+  else await switchToBranch(git, 'main');
   const full = path.join(root, filename);
   await fsp.mkdir(path.dirname(full), { recursive: true });
-  await fsp.writeFile(full, req.body.content || '');
+  if (req.body.content_b64) {
+    await fsp.writeFile(full, Buffer.from(req.body.content_b64, 'base64'));
+  } else {
+    await fsp.writeFile(full, req.body.content || '');
+  }
   res.json({ ok: true, path: filename, where, branch: req.tier === 'aap' ? req.aap.branch : (where === 'drafts' ? 'main' : null) });
 });
 
@@ -904,7 +1024,17 @@ app.post('/drafts/commit', authAny, async (req, res) => {
   try {
     const msg = (req.body.message || 'update').toString().slice(0, 200);
     const out = await git.commit(msg);
-    res.json({ ok: true, branch, commit: out.commit, summary: out.summary });
+    let versionInfo = null;
+    if (branch === 'main' && out.commit) {
+      const N = await materializeVersion(p.name);
+      versionInfo = { n: N, url: `${PUBLIC_BASE}/${p.name}/v/${N}/` };
+      try { telepathHooks.onMainCommit(p, { commit: out.commit, summary: out.summary, message: msg }, N); } catch (e) {}
+      // v0.8 autosync (fire and forget)
+      if (p.github_autosync && p.github_repo) {
+        _githubSyncProject(p).catch(e => console.error('[autosync after commit] failed:', e.message));
+      }
+    }
+    res.json({ ok: true, branch, commit: out.commit, summary: out.summary, version: versionInfo });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'commit_failed', detail: e.message });
   }
@@ -916,12 +1046,10 @@ app.get('/drafts/files', authAny, async (req, res) => {
   const where = req.query.where === 'live' ? 'live' : 'drafts';
   const pp = await ensureProjectDirs(p.name);
   const root = where === 'live' ? pp.live : pp.drafts;
-
   if (where === 'drafts' && req.tier === 'aap') {
     const git = simpleGit(pp.drafts);
     try { await switchToBranch(git, req.aap.branch); } catch(e) {}
   }
-
   const walk = (dir, base='') => {
     const out = [];
     if (!fs.existsSync(dir)) return out;
@@ -929,12 +1057,8 @@ app.get('/drafts/files', authAny, async (req, res) => {
       if (entry.name.startsWith('.')) continue;
       const rel = path.posix.join(base, entry.name);
       const abs = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        out.push(...walk(abs, rel));
-      } else {
-        const st = fs.statSync(abs);
-        out.push({ name: rel, size: st.size, mtime: st.mtime.toISOString() });
-      }
+      if (entry.isDirectory()) out.push(...walk(abs, rel));
+      else { const st = fs.statSync(abs); out.push({ name: rel, size: st.size, mtime: st.mtime.toISOString() }); }
     }
     return out;
   };
@@ -947,16 +1071,19 @@ app.get('/drafts/file', authAny, async (req, res) => {
   const where = req.query.where === 'live' ? 'live' : 'drafts';
   const relPath = String(req.query.path || '').replace(/^\/+/, '').replace(/\.\./g, '');
   const pp = await ensureProjectDirs(p.name);
-
   if (where === 'drafts' && req.tier === 'aap') {
     const git = simpleGit(pp.drafts);
     try { await switchToBranch(git, req.aap.branch); } catch(e) {}
   }
-
   const full = path.join(where === 'live' ? pp.live : pp.drafts, relPath);
   if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return res.status(404).json({ ok: false, error: 'not_found' });
-  const content = fs.readFileSync(full, 'utf8');
-  res.json({ ok: true, path: relPath, where, content });
+  try {
+    const content = fs.readFileSync(full, 'utf8');
+    res.json({ ok: true, path: relPath, where, content });
+  } catch (e) {
+    const buf = fs.readFileSync(full);
+    res.json({ ok: true, path: relPath, where, content_b64: buf.toString('base64') });
+  }
 });
 
 app.delete('/drafts/file', authAny, async (req, res) => {
@@ -965,15 +1092,9 @@ app.delete('/drafts/file', authAny, async (req, res) => {
   const where = req.query.where === 'live' && req.tier !== 'aap' ? 'live' : 'drafts';
   const relPath = String(req.query.path || '').replace(/^\/+/, '').replace(/\.\./g, '');
   const pp = await ensureProjectDirs(p.name);
-
-  if (req.tier === 'aap') {
-    const git = simpleGit(pp.drafts);
-    await switchToBranch(git, req.aap.branch);
-  } else {
-    const git = simpleGit(pp.drafts);
-    await switchToBranch(git, 'main');
-  }
-
+  const git = simpleGit(pp.drafts);
+  if (req.tier === 'aap') await switchToBranch(git, req.aap.branch);
+  else await switchToBranch(git, 'main');
   const full = path.join(where === 'live' ? pp.live : pp.drafts, relPath);
   if (!fs.existsSync(full)) return res.status(404).json({ ok: false, error: 'not_found' });
   fs.unlinkSync(full);
@@ -999,15 +1120,8 @@ app.post('/drafts/promote', authPAPorSAP, async (req, res) => {
   const git = simpleGit(pp.drafts);
   try {
     await switchToBranch(git, 'main');
-    const tmp = pp.live + '.tmp';
-    const old = pp.live + '.old';
-    try { execSync(`rm -rf "${tmp}" "${old}"`); } catch (e) {}
-    execSync(`cp -a "${pp.drafts}/" "${tmp}"`);
-    try { execSync(`rm -rf "${tmp}/.git"`); } catch (e) {}
-    try { execSync(`mv "${pp.live}" "${old}"`); } catch (e) {}
-    execSync(`mv "${tmp}" "${pp.live}"`);
-    try { execSync(`rm -rf "${old}"`); } catch (e) {}
-    res.json({ ok: true, live_url: `${PUBLIC_BASE}/live/${p.name}/` });
+    await promoteToLive(p.name);
+    res.json({ ok: true, live_url: `${PUBLIC_BASE}/${p.name}/` });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'promote_failed', detail: e.message });
   }
@@ -1016,29 +1130,45 @@ app.post('/drafts/promote', authPAPorSAP, async (req, res) => {
 app.post('/drafts/rollback', authPAPorSAP, async (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.body.project || ''));
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
-  const commit = String(req.body.commit || '');
-  if (!commit) return res.status(400).json({ ok: false, error: 'commit_required' });
+  const target = String(req.body.commit_or_version || req.body.commit || req.body.version || '');
+  if (!target) return res.status(400).json({ ok: false, error: 'commit_or_version_required' });
   const pp = await ensureProjectDirs(p.name);
   const git = simpleGit(pp.drafts);
   try {
     await switchToBranch(git, 'main');
-    await git.reset(['--hard', commit]);
-    res.json({ ok: true, reset_to: commit });
+    let commitHash = target;
+    if (/^\d+$/.test(target)) {
+      const N = Number(target);
+      const all = execSync(`git -C "${pp.drafts}" rev-list main --reverse`).toString().trim().split('\n');
+      const c = all[N];
+      if (!c) return res.status(404).json({ ok: false, error: 'version_not_found', detail: `version ${N} does not exist (have ${all.length - 1} versions)` });
+      commitHash = c;
+    }
+    await git.reset(['--hard', commitHash]);
+    try { await git.commit(`rollback to ${target}`, { '--allow-empty': null }); } catch (e) {}
+    const total = Number(execSync(`git -C "${pp.drafts}" rev-list --count main`).toString().trim());
+    const newN = Math.max(1, total - 1);
+    try { execSync(`rm -rf "${path.join(pp.versions, String(newN))}"`); } catch (e) {}
+    if (fs.existsSync(pp.versions)) {
+      for (const dir of fs.readdirSync(pp.versions)) {
+        if (/^\d+$/.test(dir) && Number(dir) > newN) {
+          try { execSync(`rm -rf "${path.join(pp.versions, dir)}"`); } catch (e) {}
+        }
+      }
+    }
+    const N = await materializeVersion(p.name);
+    res.json({ ok: true, reset_to: commitHash, new_version: N, version_url: `${PUBLIC_BASE}/${p.name}/v/${N}/` });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'rollback_failed', detail: e.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// GitHub configuration (SAP sets server default, PAP overrides per-project)
-// ─────────────────────────────────────────────────────────────
-
+// GitHub config
 app.get('/drafts/config/github', authSAP, (req, res) => {
   const cfg = state.github_default;
   if (!cfg || !cfg.token) return res.json({ ok: true, configured: false });
   res.json({ ok: true, configured: true, user: cfg.user, token_preview: cfg.token.slice(0, 4) + '...' + cfg.token.slice(-4) });
 });
-
 app.put('/drafts/config/github', authSAP, (req, res) => {
   const user = String(req.body.user || '').trim();
   const token = String(req.body.token || '').trim();
@@ -1047,79 +1177,214 @@ app.put('/drafts/config/github', authSAP, (req, res) => {
   saveState();
   res.json({ ok: true, configured: true, user });
 });
-
 app.delete('/drafts/config/github', authSAP, (req, res) => {
-  delete state.github_default;
-  saveState();
+  delete state.github_default; saveState();
   res.json({ ok: true, configured: false });
 });
-
 app.get('/drafts/projects/:name/config/github', authPAPorSAP, (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.params.name));
   if (!p) return res.status(404).json({ ok: false, error: 'project_not_found' });
   const cfg = p.github_config;
-  if (!cfg || !cfg.token) return res.json({ ok: true, configured: false, falls_back_to: state.github_default ? 'server_default' : (GITHUB_TOKEN ? 'env' : 'none') });
+  if (!cfg || !cfg.token) return res.json({ ok: true, configured: false });
   res.json({ ok: true, configured: true, user: cfg.user, token_preview: cfg.token.slice(0, 4) + '...' + cfg.token.slice(-4) });
 });
-
 app.put('/drafts/projects/:name/config/github', authPAPorSAP, (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.params.name));
   if (!p) return res.status(404).json({ ok: false, error: 'project_not_found' });
   const user = String(req.body.user || '').trim();
   const token = String(req.body.token || '').trim();
   if (!user || !token) return res.status(400).json({ ok: false, error: 'user_and_token_required' });
-  p.github_config = { user, token };
-  saveState();
+  p.github_config = { user, token }; saveState();
   res.json({ ok: true, configured: true, user });
 });
-
 app.delete('/drafts/projects/:name/config/github', authPAPorSAP, (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.params.name));
   if (!p) return res.status(404).json({ ok: false, error: 'project_not_found' });
-  delete p.github_config;
-  saveState();
+  delete p.github_config; saveState();
   res.json({ ok: true, configured: false });
 });
-
-// ─────────────────────────────────────────────────────────────
-// GitHub sync (PAP/SAP only) — uses resolveGithubConfig
-// ─────────────────────────────────────────────────────────────
 
 app.post('/drafts/github/sync', authPAPorSAP, async (req, res) => {
   const p = req.project || findProjectByName(sanitizeName(req.body.project || ''));
   if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
-  if (!p.github_repo) return res.status(400).json({ ok: false, error: 'project_not_linked_to_github' });
-  const gh = resolveGithubConfig(p);
-  if (!gh) return res.status(500).json({
-    ok: false,
-    error: 'github_not_configured',
-    hint: 'Set server default via PUT /drafts/config/github (SAP) or per-project via PUT /drafts/projects/:name/config/github (PAP)'
-  });
-  const pp = await ensureProjectDirs(p.name);
-  const git = simpleGit(pp.drafts);
   try {
-    await switchToBranch(git, 'main');
-    const remoteUrl = `https://${gh.user}:${gh.token}@github.com/${p.github_repo}.git`;
-    const remotes = await git.getRemotes();
-    if (!remotes.find(r => r.name === 'origin')) {
-      await git.addRemote('origin', remoteUrl);
-    } else {
-      await git.remote(['set-url', 'origin', remoteUrl]);
-    }
-    await git.push(['-u', 'origin', 'main', '--force']);
-    // scrub token from remote URL
-    await git.remote(['set-url', 'origin', `https://github.com/${p.github_repo}.git`]);
-    res.json({ ok: true, pushed_to: p.github_repo, config_source: gh.source });
+    const out = await _githubSyncProject(p);
+    res.json({ ok: true, ...out });
   } catch (e) {
-    res.status(500).json({ ok: false, error: 'github_sync_failed', detail: e.message });
+    const status = (e.message === 'project_not_linked_to_github' || e.message === 'github_not_configured') ? 400 : 500;
+    res.status(status).json({ ok: false, error: e.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
+// v0.8: per-project github autosync toggle
+app.put('/drafts/projects/:name/github_autosync', authPAPorSAP, (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.params.name));
+  if (!p) return res.status(404).json({ ok: false, error: 'project_not_found' });
+  if (!p.github_repo) return res.status(400).json({ ok: false, error: 'project_not_linked_to_github' });
+  const enabled = req.body.enabled !== false;
+  p.github_autosync = !!enabled;
+  saveState();
+  res.json({ ok: true, github_autosync: p.github_autosync });
+});
+
+// v0.8: link/unlink github repo for a project (PAP can also do this — needs repo full name)
+app.put('/drafts/projects/:name/github_repo', authPAPorSAP, (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.params.name));
+  if (!p) return res.status(404).json({ ok: false, error: 'project_not_found' });
+  const repo = String(req.body.github_repo || '').trim();
+  if (repo && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return res.status(400).json({ ok: false, error: 'bad_repo_format', detail: 'expected owner/repo' });
+  p.github_repo = repo || null;
+  if (!p.github_repo) p.github_autosync = false;
+  saveState();
+  res.json({ ok: true, github_repo: p.github_repo, github_autosync: !!p.github_autosync });
+});
+
+// Public project routes — must come AFTER all /drafts/* and /telepath/* routes
+
+function isProjectName(slug) {
+  if (!slug) return false;
+  if (isReservedName(slug)) return false;
+  if (!/^[a-z0-9_-]{1,40}$/.test(slug)) return false;
+  return !!findProjectByName(slug);
+}
+
+app.use((req, res, next) => {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+  const url = req.path;
+  if (url.startsWith('/drafts/') || url.startsWith('/m/') || url.startsWith('/telepath/')) return next();
+  const m = url.match(/^\/([a-z0-9_-]+)(\/.*)?$/);
+  if (!m) return next();
+  const name = m[1];
+  const rest = m[2] || '';
+  if (!isProjectName(name)) return next();
+  if (rest === '') return res.redirect(301, `/${name}/`);
+  const pp = projectPaths(name);
+  const vm = rest.match(/^\/v\/(\d+)(\/.*)?$/);
+  if (vm) {
+    const N = vm[1];
+    const subRest = vm[2];
+    const versionDir = path.join(pp.versions, N);
+    if (!fs.existsSync(versionDir)) return res.status(404).type('text/plain').send('version not found');
+    if (subRest === undefined) return res.redirect(301, `/${name}/v/${N}/`);
+    return serveStatic(versionDir, subRest.replace(/^\/+/, ''), res);
+  }
+  if (!fs.existsSync(pp.live)) return res.status(404).type('text/plain').send('not yet promoted');
+  return serveStatic(pp.live, rest.replace(/^\/+/, ''), res);
+});
+
+
+// 
+// v0.9: Auto-update + Autopilot endpoints
+// 
+
+app.get('/drafts/autoupdate', authSAP, (req, res) => {
+  const cfg = state.autoupdate || { drafts: false, telepath: false };
+  res.json({ ok: true, drafts: !!cfg.drafts, telepath: !!cfg.telepath });
+});
+
+app.put('/drafts/autoupdate', authSAP, (req, res) => {
+  state.autoupdate = {
+    drafts: !!req.body.drafts,
+    telepath: !!req.body.telepath,
+    updated_at: now(),
+  };
+  saveState();
+  res.json({ ok: true, drafts: state.autoupdate.drafts, telepath: state.autoupdate.telepath });
+});
+
+// Autopilot job queue (in-memory; agent picks up via GET /drafts/autopilot/jobs)
+state.autopilot = state.autopilot || { jobs: [] };
+if (!state.autopilot.jobs) state.autopilot.jobs = [];
+
+app.post('/drafts/autopilot', authPAPorSAP, (req, res) => {
+  const goal = String(req.body.goal || '').trim();
+  if (!goal) return res.status(400).json({ ok: false, error: 'goal_required' });
+  const job = {
+    id: newId(),
+    project: req.project ? req.project.name : null,
+    goal: goal.slice(0, 2000),
+    loop: req.body.loop !== false,
+    created_at: now(),
+    status: 'queued',
+    iterations: [],
+  };
+  state.autopilot.jobs.push(job);
+  if (state.autopilot.jobs.length > 200) state.autopilot.jobs = state.autopilot.jobs.slice(-200);
+  saveState();
+  res.json({ ok: true, job_id: job.id, project: job.project });
+});
+
+app.get('/drafts/autopilot/jobs', authAny, (req, res) => {
+  const jobs = state.autopilot.jobs.filter(j => req.tier === 'sap' || (req.project && j.project === req.project.name));
+  res.json({ ok: true, jobs: jobs.slice(-50) });
+});
+
+app.post('/drafts/autopilot/:id/iterate', authPAPorSAP, (req, res) => {
+  const j = state.autopilot.jobs.find(x => x.id === req.params.id);
+  if (!j) return res.status(404).json({ ok: false, error: 'job_not_found' });
+  j.iterations.push({
+    at: now(),
+    test_result: req.body.test_result || null,
+    fix_applied: req.body.fix_applied || null,
+    notes: (req.body.notes || '').slice(0, 1000),
+  });
+  if (req.body.done) j.status = 'done';
+  else j.status = 'running';
+  saveState();
+  res.json({ ok: true, status: j.status, iteration: j.iterations.length });
+});
+
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`drafts v0.2 listening on 127.0.0.1:${PORT}`);
+  console.log(`drafts v${VERSION} listening on 127.0.0.1:${PORT}`);
   console.log(`  public_base: ${PUBLIC_BASE}`);
   console.log(`  server_number: ${SERVER_NUMBER}`);
   console.log(`  data_dir: ${DRAFTS_DIR}`);
   console.log(`  SAP welcome: ${PUBLIC_BASE}/drafts/pass/drafts_server_${SERVER_NUMBER}_${SAP_TOKEN.slice(0,8)}... (full token in /etc/labs/drafts.sap)`);
+
+  initTelepath({
+    draftsDir: DRAFTS_DIR,
+    publicBase: PUBLIC_BASE,
+    serverNumber: SERVER_NUMBER,
+    getSAP: () => SAP_TOKEN,
+    getDraftsState: () => state,
+    saveDraftsState: saveState,
+    findProjectByName,
+    findProjectByPAP,
+    findProjectAndAAPByAAPToken,
+    ensureProjectDirs,
+    listVersions,
+    serverHelpers: {
+      createProject: _createProjectInternal,
+      createAAP: _createAAPInternal,
+      githubSyncProject: _githubSyncProject,
+    },
+  });
+
+  initProjectBots({
+    publicBase: PUBLIC_BASE,
+    getDraftsState: () => state,
+    saveDraftsState: saveState,
+    findProjectByName,
+  });
+
+  // Daily snapshot scheduler
+  startDailySnapshotScheduler(() => state, DRAFTS_DIR);
+
+  // v0.8: SAP boot/version-bump notifications (after 8s so Telepath has time to load polling+hooks)
+  setTimeout(() => {
+    try {
+      const projectCount = state.projects.length;
+      const botCount = state.projects.filter(p => p.bot && p.bot.token).length;
+      const uptime = Math.floor(process.uptime());
+      if (isVersionBump) {
+        telepathHooks.onVersionBump(previousVersion, VERSION, { projectCount, botCount });
+      } else if (isFirstBoot) {
+        telepathHooks.onDraftsBoot(VERSION, { projectCount, botCount, uptime, firstBoot: true });
+      } else {
+        telepathHooks.onDraftsBoot(VERSION, { projectCount, botCount, uptime, firstBoot: false });
+      }
+    } catch (e) {
+      console.error('[drafts] boot hook error:', e.message);
+    }
+  }, 8000);
 });
