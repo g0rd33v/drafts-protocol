@@ -64,6 +64,111 @@ const WEBHOOK_LOG_MAX = 20;
 const pollers = new Map();
 // Cache: projectName -> { mtime, parsed }
 const botJsonCache = new Map();
+// 
+// cron.json (v0.9.6)  scheduled webhook deliveries for webhook-mode bots
+// Schedule format supported: "* * * * *" or "*/N * * * *" (minute granularity).
+// On a match drafts POSTs {drafts_cron, ts} to project's webhook_url.
+// 
+const cronJsonCache = new Map();
+const CRON_TICK_MS = 60000;
+const CRON_SCHEDULE_RE = /^(\*|\*\/[0-9]{1,2})\s+\*\s+\*\s+\*\s+\*$/;
+let cronTickerTimer = null;
+let cronLastTickMinute = -1;
+
+function loadCronJson(projectName) {
+  try {
+    const livePath = path.join(process.env.DRAFTS_DIR || '/var/lib/drafts', projectName, 'live', 'cron.json');
+    if (!fs.existsSync(livePath)) return null;
+    const stat = fs.statSync(livePath);
+    const mtime = stat.mtimeMs;
+    const cached = cronJsonCache.get(projectName);
+    if (cached && cached.mtime === mtime) return cached.parsed;
+    const raw = fs.readFileSync(livePath, 'utf8');
+    let parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) parsed = [];
+    parsed = parsed
+      .filter(e => e && typeof e === 'object' && typeof e.schedule === 'string' && typeof e.handler === 'string')
+      .map(e => ({ schedule: e.schedule.trim(), handler: e.handler.trim().slice(0, 64) }))
+      .filter(e => CRON_SCHEDULE_RE.test(e.schedule) && e.handler.length > 0);
+    cronJsonCache.set(projectName, { mtime, parsed });
+    return parsed;
+  } catch (e) {
+    console.warn('[cron:' + projectName + '] cron.json load failed:', e.message);
+    return null;
+  }
+}
+
+function shouldFireSchedule(schedule, minuteOfHour) {
+  if (!CRON_SCHEDULE_RE.test(schedule)) return false;
+  const m = schedule.split(/\s+/)[0];
+  if (m === '*') return true;
+  const mm = m.match(/^\*\/([0-9]{1,2})$/);
+  if (!mm) return false;
+  const n = parseInt(mm[1], 10);
+  if (!n || n < 1 || n > 59) return false;
+  return (minuteOfHour % n) === 0;
+}
+
+async function fireCron(project, handler) {
+  if (!project.bot || !project.bot.webhook_url) return;
+  const synth = {
+    update_id: -Math.floor(Date.now() / 1000),
+    drafts_cron: handler,
+    ts: now(),
+  };
+  const headers = {
+    'X-Drafts-Project': project.name,
+    'X-Drafts-Cron-Handler': handler,
+    'X-Drafts-Bot-Username': '@' + (project.bot.bot_username || ''),
+  };
+  let result = await forwardToWebhook(project.bot.webhook_url, synth, headers);
+  if (!result.ok) {
+    await sleep(WEBHOOK_RETRY_DELAY_MS);
+    result = await forwardToWebhook(project.bot.webhook_url, synth, headers);
+  }
+  appendWebhookLog(project, {
+    at: now(), update_id: synth.update_id,
+    status: result.status || 0, latency_ms: result.latency_ms || 0,
+    error: result.error || null, kind: 'cron:' + handler,
+  });
+}
+
+async function cronTick() {
+  const minute = Math.floor(Date.now() / 60000);
+  if (minute === cronLastTickMinute) return;
+  cronLastTickMinute = minute;
+  const minuteOfHour = new Date(minute * 60000).getUTCMinutes();
+  const state = getDraftsState();
+  for (const project of state.projects) {
+    if (!project.bot || !project.bot.token || !project.bot.webhook_url) continue;
+    const cron = loadCronJson(project.name);
+    if (!cron || !cron.length) continue;
+    for (const entry of cron) {
+      if (shouldFireSchedule(entry.schedule, minuteOfHour)) {
+        fireCron(project, entry.handler).catch(e =>
+          console.error('[cron:' + project.name + ':' + entry.handler + '] fire error:', e.message)
+        );
+      }
+    }
+  }
+}
+
+function startCronTicker() {
+  if (cronTickerTimer) return;
+  const msUntilMinute = 60000 - (Date.now() % 60000);
+  setTimeout(() => {
+    cronTick().catch(e => console.error('[cron] tick error:', e.message));
+    cronTickerTimer = setInterval(() => {
+      cronTick().catch(e => console.error('[cron] tick error:', e.message));
+    }, CRON_TICK_MS);
+  }, msUntilMinute);
+  console.log('[cron] ticker armed; first fire in ' + msUntilMinute + 'ms');
+}
+
+function stopCronTicker() {
+  if (cronTickerTimer) { clearInterval(cronTickerTimer); cronTickerTimer = null; }
+}
+
 
 // ─────────────────────────────────────────────────────────────
 // Telegram HTTP client (per-bot — token passed in)
@@ -643,6 +748,7 @@ async function unlinkBot(project, opts = {}) {
   stopPolling(project.name);
   delete project.bot;
   botJsonCache.delete(project.name);
+  cronJsonCache.delete(project.name);
   saveDraftsState();
   return { removed: wasInstalled };
 }
@@ -651,6 +757,7 @@ async function syncBot(project, broadcastMessageHtml) {
   if (!project.bot || !project.bot.token) throw new Error('no_bot');
   // Bust bot.json cache so newly-uploaded bot.json takes effect immediately
   botJsonCache.delete(project.name);
+  cronJsonCache.delete(project.name);
   const result = await applyBotProfile(project);
   let broadcastResult = { sent: 0, failed: 0, skipped: true };
   if (broadcastMessageHtml && broadcastMessageHtml.trim() && !project.bot.webhook_url) {
@@ -738,6 +845,7 @@ export function initProjectBots(opts) {
   }
   if (migrated) { saveDraftsState(); console.log(`[project-bots] migrated ${migrated} bot(s) → analytics_enabled=true`); }
   console.log('[project-bots] init complete — ' + started + ' bot poller(s) started');
+  startCronTicker();
 }
 
 export const projectBotsApi = {
@@ -753,4 +861,5 @@ export const projectBotsApi = {
   removeSubscriber,
   validateWebhookUrl,
   loadBotJson,
+  loadCronJson,
 };

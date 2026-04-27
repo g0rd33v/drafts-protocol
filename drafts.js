@@ -29,7 +29,7 @@ import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathS
 import { initProjectBots, projectBotsApi } from "./project-bots.js";
 import { startDailySnapshotScheduler } from "./analytics.js";
 
-const VERSION = '0.9.5';
+const VERSION = '0.9.6';
 
 // v0.9.4: detect telepath.js  when present, every project gets bot management automatically
 const TELEPATH_AVAILABLE = (() => {
