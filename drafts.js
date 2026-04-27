@@ -29,7 +29,7 @@ import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathS
 import { initProjectBots } from "./project-bots.js";
 import { startDailySnapshotScheduler } from "./analytics.js";
 
-const VERSION = '0.9';
+const VERSION = '0.9.1';
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -643,6 +643,19 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     html += '</div></div>';
   }
 
+  // Human Upload section (PAP/AAP - file picker for manual uploads)
+  if (isPAP || isAAP) {
+    html += '<div class="v9-section"><h3>Upload files <span class="badge2">human upload</span></h3>';
+    html += '<p>Pick any file from your computer and upload it to the project root. Drag-drop or click to choose. After upload, files land in drafts; click Promote to publish.</p>';
+    html += '<input type="file" id="v91-files" multiple style="display:block;width:100%;padding:14px;background:#000;border:1px dashed var(--border);border-radius:10px;color:var(--text-2);font-family:inherit;font-size:13px;cursor:pointer;margin:10px 0"/>';
+    html += '<div class="row"><label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);text-transform:none;letter-spacing:0"><input type="checkbox" id="v91-commit" checked/> Commit after upload</label>';
+    if (isPAP) html += '<label style="display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--text-2);text-transform:none;letter-spacing:0;margin-left:20px"><input type="checkbox" id="v91-promote"/> Promote to live</label>';
+    html += '</div>';
+    html += '<div class="actions"><button class="v9-prim" id="v91-up">Upload</button></div>';
+    html += '<div class="v9-status" id="v91-status"></div>';
+    html += '</div>';
+  }
+
   // Autopilot section (PAP/AAP  inline on the page, not a modal)
   if (isPAP || isAAP) {
     html += '<div class="v9-section"><h3> Autopilot <span class="badge2">create-test-fix</span></h3>';
@@ -663,6 +676,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
   html += 'var tr=document.getElementById("v9-tap-revoke");if(tr)tr.addEventListener("click",function(){if(!confirm("Revoke Telepath?"))return;fetch(API+"/tap",{method:"DELETE",headers:{"Authorization":"Bearer "+T}}).then(function(){location.reload()})});';
   html += 'var us=document.getElementById("v9-up-save");if(us){fetch(API+"/autoupdate",{headers:{"Authorization":"Bearer "+T}}).then(function(r){return r.json()}).then(function(d){if(d.ok){var a=document.getElementById("v9-up-drafts");if(a)a.checked=!!d.drafts;var b=document.getElementById("v9-up-telepath");if(b)b.checked=!!d.telepath}});us.addEventListener("click",function(){var d=document.getElementById("v9-up-drafts").checked;var tp=document.getElementById("v9-up-telepath").checked;st("v9-up-status","saving...");fetch(API+"/autoupdate",{method:"PUT",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({drafts:d,telepath:tp})}).then(function(r){return r.json()}).then(function(x){st("v9-up-status",x.ok?"saved":"err: "+x.error,x.ok?"ok":"err")})})}';
   html += 'var ap=document.getElementById("v9-ap-start");if(ap)ap.addEventListener("click",function(){var g=document.getElementById("v9-ap-goal").value.trim();if(!g){st("v9-ap-status","goal required","err");return}st("v9-ap-status","queued. Open this page in Claude for Chrome  agent will pick up the autopilot job and run create-test-fix loop.");fetch(API+"/autopilot",{method:"POST",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({goal:g,loop:document.getElementById("v9-ap-loop").checked})}).then(function(r){return r.json()}).then(function(d){if(d.ok)st("v9-ap-status","job "+d.job_id+" queued  autopilot loop active","ok");else st("v9-ap-status","err: "+d.error,"err")})});';
+  html += 'var up=document.getElementById("v91-up");if(up)up.addEventListener("click",async function(){var fi=document.getElementById("v91-files");var files=fi.files;if(!files||!files.length){st("v91-status","pick at least one file","err");return}var doCommit=document.getElementById("v91-commit").checked;var pEl=document.getElementById("v91-promote");var doPromote=pEl&&pEl.checked;st("v91-status","uploading 0/"+files.length+"...");for(var i=0;i<files.length;i++){var f=files[i];try{var b64=await new Promise(function(res,rej){var r=new FileReader();r.onload=function(){res(r.result.split(",")[1])};r.onerror=function(){rej(r.error)};r.readAsDataURL(f)});var rsp=await fetch(API+"/upload",{method:"POST",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({filename:f.name,content_b64:b64})});var jd=await rsp.json();if(!jd.ok){st("v91-status","failed on "+f.name+": "+jd.error,"err");return}st("v91-status","uploaded "+(i+1)+"/"+files.length+": "+f.name)}catch(e){st("v91-status","error: "+e.message,"err");return}}if(doCommit){st("v91-status","committing...");var cr=await fetch(API+"/commit",{method:"POST",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({message:"human upload: "+files.length+" file(s)"})}).then(function(r){return r.json()});if(!cr.ok){st("v91-status","commit failed: "+cr.error,"err");return}}if(doPromote){st("v91-status","promoting...");var pr=await fetch(API+"/promote",{method:"POST",headers:{"Authorization":"Bearer "+T,"Content-Type":"application/json"},body:JSON.stringify({})}).then(function(r){return r.json()});if(!pr.ok){st("v91-status","promote failed: "+pr.error,"err");return}st("v91-status","uploaded + committed + promoted to live ✓","ok")}else if(doCommit){st("v91-status","uploaded + committed ✓","ok")}else{st("v91-status","uploaded ✓ (not committed)","ok")}fi.value=""});';
   html += '})();</script>';
 
   html += '</div></body></html>';
