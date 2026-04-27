@@ -26,10 +26,19 @@ import { execSync } from 'child_process';
 import dotenv from 'dotenv';
 import { buildRichContext } from "./rich-context.js";
 import { initTelepath, mountTelepathRoutes, hooks as telepathHooks, getTelepathStatus } from "./telepath.js";
-import { initProjectBots } from "./project-bots.js";
+import { initProjectBots, projectBotsApi } from "./project-bots.js";
 import { startDailySnapshotScheduler } from "./analytics.js";
 
-const VERSION = '0.9.2';
+const VERSION = '0.9.4';
+
+// v0.9.4: detect telepath.js  when present, every project gets bot management automatically
+const TELEPATH_AVAILABLE = (() => {
+  try {
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    return fs.existsSync(path.join(here, 'telepath.js'));
+  } catch (e) { return true; }
+})();
+
 
 // Config: try /etc/labs/drafts.env first (production), then ./drafts.env (dev), then legacy
 const ENV_CANDIDATES = ['/etc/labs/drafts.env', './drafts.env', '/opt/drafts-receiver/.env'];
@@ -443,6 +452,8 @@ app.get('/drafts/health', (req, res) => {
     version: VERSION,
     protocol: 'drafts',
     server_number: SERVER_NUMBER,
+    telepath_available: TELEPATH_AVAILABLE,
+    project_bots_capability: TELEPATH_AVAILABLE,
     telepath: tp,
     project_bots: { total: projectBotsCount, in_webhook_mode: webhookBotsCount, analytics_enabled: analyticsEnabledCount },
     github_autosync_enabled: githubAutosyncCount,
@@ -485,6 +496,7 @@ function buildAgentPlaybook(tier, project, apiBase, token) {
         `Live URL is ${liveUrl} — share this when someone asks "where is the site?"`,
         'Every commit on main produces an immutable snapshot at /v/<N>/. Versions are forever.',
         'For collaborative work, mint AAPs (POST /aaps) and share the activation_url. Never share the PAP itself.',
+        ...(TELEPATH_AVAILABLE ? ['Telepath is available on this server: every project can attach its own Telegram bot. Configure behavior by uploading bot.json to project root, then sync.'] : []),
       ],
       common_tasks: [
         { goal: 'Check current state', call: `GET ${apiBase}/project/info  +  GET ${apiBase}/files` },
@@ -496,8 +508,30 @@ function buildAgentPlaybook(tier, project, apiBase, token) {
         { goal: 'Invite a contributor', call: `POST ${apiBase}/aaps  {"name":"alice"}  → share activation_url` },
         { goal: 'Review pending AAP work', call: `GET ${apiBase}/pending` },
         { goal: 'Merge an AAP branch', call: `POST ${apiBase}/merge  {"aap_id":"<id>"}` },
+        ...(TELEPATH_AVAILABLE ? [
+          { goal: 'Check bot status', call: `GET ${apiBase}/project/bot` },
+          { goal: 'Attach a Telegram bot', call: `PUT ${apiBase}/project/bot  {"token":"<bot_token_from_BotFather>"}` },
+          { goal: 'Configure bot via bot.json', call: `POST ${apiBase}/upload  {"filename":"bot.json","content":"<json>"}  →  /commit  →  /promote  →  POST ${apiBase}/project/bot/sync` },
+          { goal: 'Sync bot profile from live', call: `POST ${apiBase}/project/bot/sync` },
+          { goal: 'Switch bot to webhook mode', call: `PUT ${apiBase}/project/bot/webhook  {"url":"https://your.server/hook"}` },
+          { goal: 'Broadcast to subscribers', call: `POST ${apiBase}/project/bot/broadcast  {"html":"<b>Hello</b>"}` },
+          { goal: 'Disconnect the bot', call: `DELETE ${apiBase}/project/bot` },
+        ] : []),
       ],
       build_loop: 'Plan → upload → commit → promote → check live URL → iterate. Keep commits small and named.',
+      bot_capability_note: TELEPATH_AVAILABLE ? 'This server has telepath.js  every project can attach a Telegram bot. Configure via bot.json in the project root, or via webhook mode.' : null,
+      bot_json_schema: TELEPATH_AVAILABLE ? {
+        notes: 'Place bot.json at project root. After upload + commit + promote, call POST /drafts/project/bot/sync to push commands to Telegram and bust the bot.json cache. The bot reads bot.json from <project>/live/bot.json.',
+        example: {
+          version: 'drafts.bot.v1',
+          commands: [
+            { command: 'start', description: 'Begin', reply: { text: '<b>Welcome!</b>', parse_mode: 'HTML', buttons: [[{ text: 'Open site', url: liveUrl }, { text: 'Help', callback_data: 'help' }]] } },
+            { command: 'about', description: 'About this project', reply: { text: 'A project on drafts.' } },
+          ],
+          default_reply: { text: 'Use /start to see the menu.' },
+          callbacks: { help: { text: 'Send /start to see the menu, /about for info.' } },
+        },
+      } : null,
     };
   }
 
@@ -529,6 +563,11 @@ function renderAgentPlaybookHTML(playbook, tier) {
   const extras = (playbook.build_loop || playbook.handoff)
     ? '<div class="agent-extra"><strong>Loop:</strong> ' + (playbook.build_loop || playbook.handoff) + '</div>'
     : '';
+  const botJsonHtml = playbook.bot_json_schema
+    ? '<div class="agent-section-title">bot.json schema (Telegram bot config)</div>' +
+      '<p style="font-size:12.5px;color:var(--text-2);line-height:1.55;margin-bottom:8px">' + playbook.bot_json_schema.notes + '</p>' +
+      '<pre class="agent-botjson">' + JSON.stringify(playbook.bot_json_schema.example, null, 2).replace(/</g,"&lt;") + '</pre>'
+    : '';
 
   return `
     <div class="v9-section agent-playbook">
@@ -543,6 +582,7 @@ function renderAgentPlaybookHTML(playbook, tier) {
         ${tasks}
       </div>
       ${extras}
+      ${botJsonHtml}
       <div class="agent-howto">
         <div class="agent-section-title">How to use this link</div>
         <p>Open this page in <a href="${CHROME_EXT_URL}" target="_blank">Claude for Chrome</a> sidepanel — Claude reads everything below (including the JSON instructions) and starts acting as the ${tier.toUpperCase()} agent. Or paste the URL into any Claude chat (web, Desktop, Code) and it will fetch this page and pick up the same context.</p>
@@ -558,6 +598,7 @@ function renderAgentPlaybookHTML(playbook, tier) {
       .agent-playbook .agent-extra{margin-top:14px;padding:10px 12px;background:rgba(96,165,250,0.06);border-left:2px solid #60a5fa;border-radius:0 6px 6px 0;font-size:12.5px;color:var(--text-2);line-height:1.55}
       .agent-playbook .agent-howto{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
       .agent-playbook .agent-howto p{font-size:12.5px;color:var(--text-2);line-height:1.55;margin:0}
+      .agent-playbook .agent-botjson{display:block;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:11.5px;font-family:var(--mono,ui-monospace,Menlo,monospace);color:var(--text-2);overflow-x:auto;line-height:1.5;margin-bottom:12px}
     </style>
   `;
 }
@@ -611,7 +652,7 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
     on_first_load: { summary: project ? `Check ${apiBase}/project/info + files + history and greet based on state.` : 'Greet warmly, offer overview.' },
     transport: 'Try built-in HTTP tools first; on failure switch to Claude for Chrome silently.',
     capabilities: isSAP ? ['list_projects','create_project','delete_project','revoke_passes','configure_github_default','manage_telepath_bot']
-      : isPAP ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','github_autosync','attach_telegram_bot','set_bot_webhook_url','view_bot_analytics']
+      : isPAP ? (TELEPATH_AVAILABLE ? ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','github_autosync','attach_telegram_bot','set_bot_webhook_url','sync_bot_from_botjson','broadcast_to_subscribers','view_bot_analytics'] : ['build','publish','invite_aaps','merge','rollback_to_version','github_sync','github_autosync'])
       : ['build_in_branch','read_live','read_history'],
     endpoints: isSAP ? [
       { method: 'GET', path: '/projects' },
@@ -629,6 +670,15 @@ function renderPage({ tier, token, project, aap, versions = [] }) {
       { method: 'POST', path: '/rollback', body: '{commit_or_version}' },
       { method: 'POST', path: '/aaps', body: '{name?}' },
       { method: 'POST', path: '/merge', body: '{aap_id}' },
+      ...(TELEPATH_AVAILABLE ? [
+        { method: 'GET', path: '/project/bot' },
+        { method: 'PUT', path: '/project/bot', body: '{token, webhook_url?}' },
+        { method: 'DELETE', path: '/project/bot' },
+        { method: 'POST', path: '/project/bot/sync', body: '{broadcast_html?}' },
+        { method: 'PUT', path: '/project/bot/webhook', body: '{url|null}' },
+        { method: 'PUT', path: '/project/bot/analytics', body: '{enabled}' },
+        { method: 'POST', path: '/project/bot/broadcast', body: '{html}' },
+      ] : []),
     ] : [
       { method: 'POST', path: '/upload', body: '{filename, content}' },
       { method: 'POST', path: '/commit' },
@@ -1037,6 +1087,96 @@ app.get('/drafts/project/versions', authAny, async (req, res) => {
     out.push({ n: N, url: `${PUBLIC_BASE}/${p.name}/v/${N}/`, hash: hash ? hash.slice(0,7) : null, message: msg, date });
   }
   res.json({ ok: true, project: p.name, versions: out });
+});
+
+
+// v0.9.4: Project bot management endpoints (gated on TELEPATH_AVAILABLE)
+function requireBotCapability(req, res) {
+  if (!TELEPATH_AVAILABLE) {
+    res.status(501).json({ ok: false, error: 'bot_capability_unavailable', detail: 'telepath.js not present on this server' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/drafts/project/bot', authPAPorSAP, (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  res.json({ ok: true, project: p.name, bot: projectBotsApi.getBotStatus(p) });
+});
+
+app.put('/drafts/project/bot', authPAPorSAP, async (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  const tk = String(req.body.token || '').trim();
+  if (!/^\d+:[A-Za-z0-9_-]{30,}$/.test(tk)) {
+    return res.status(400).json({ ok: false, error: 'invalid_bot_token_format' });
+  }
+  try {
+    const out = await projectBotsApi.installBot(p, tk, { webhook_url: req.body.webhook_url || null });
+    res.json({ ok: true, project: p.name, bot: out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'install_failed', detail: e.message });
+  }
+});
+
+app.delete('/drafts/project/bot', authPAPorSAP, async (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  const out = await projectBotsApi.unlinkBot(p, { notify_subscribers: !!(req.body && req.body.notify_subscribers) });
+  res.json({ ok: true, project: p.name, ...out });
+});
+
+app.post('/drafts/project/bot/sync', authPAPorSAP, async (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  try {
+    const out = await projectBotsApi.syncBot(p, (req.body && req.body.broadcast_html) || null);
+    res.json({ ok: true, project: p.name, ...out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'sync_failed', detail: e.message });
+  }
+});
+
+app.put('/drafts/project/bot/webhook', authPAPorSAP, async (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  try {
+    const url = req.body && Object.prototype.hasOwnProperty.call(req.body, 'url') ? req.body.url : null;
+    const out = await projectBotsApi.setWebhookUrl(p, url);
+    res.json({ ok: true, project: p.name, ...out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'webhook_failed', detail: e.message });
+  }
+});
+
+app.put('/drafts/project/bot/analytics', authPAPorSAP, (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  try {
+    const out = projectBotsApi.setAnalyticsEnabled(p, !!(req.body && req.body.enabled));
+    res.json({ ok: true, project: p.name, ...out });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/drafts/project/bot/broadcast', authPAPorSAP, async (req, res) => {
+  const p = req.project || findProjectByName(sanitizeName(req.query.project || ''));
+  if (!p) return res.status(400).json({ ok: false, error: 'no_project_context' });
+  if (!requireBotCapability(req, res)) return;
+  if (!p.bot || !p.bot.token) return res.status(400).json({ ok: false, error: 'no_bot_attached' });
+  if (p.bot.webhook_url) return res.status(400).json({ ok: false, error: 'broadcast_unavailable_in_webhook_mode' });
+  const html = String((req.body && req.body.html) || '').trim();
+  if (!html) return res.status(400).json({ ok: false, error: 'html_required' });
+  const out = await projectBotsApi.broadcast(p, html);
+  res.json({ ok: true, project: p.name, ...out });
 });
 
 app.post('/drafts/aaps', authPAPorSAP, async (req, res) => {
